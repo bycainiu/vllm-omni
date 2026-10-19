@@ -42,7 +42,7 @@ class _FakeAttention(nn.Module):
         super().__init__()
 
 
-def _small_od_config(*, class_name=None):
+def _small_od_config(*, class_name=None, cache_config=None):
     arch = {
         "num_layers": 1,
         "token_refiner_num_layers": 1,
@@ -66,6 +66,7 @@ def _small_od_config(*, class_name=None):
     return SimpleNamespace(
         tf_model_config=arch,
         parallel_config=SimpleNamespace(ulysses_degree=1),
+        cache_config={} if cache_config is None else cache_config,
     )
 
 
@@ -152,6 +153,49 @@ def test_explicit_native_weight_format_overrides_diffusers_class_name(monkeypatc
     )
 
     assert model._diffusers_weights is False
+
+
+def test_fused_adaln_qkv_config_is_applied_only_to_dit_blocks(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    monkeypatch.setattr(h3, "ColumnParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    model = h3.MiniMaxH3DiTModel(
+        _small_od_config(cache_config={"minimax_h3_fused_adaln_qkv": True}),
+    )
+
+    assert model.fuse_adaln_qkv is True
+    assert model.blocks[0].attn.fuse_adaln_qkv is True
+    assert model.token_refiner.blocks[0].attn.fuse_adaln_qkv is False
+
+
+def test_fused_adaln_qkv_accepts_full_fp8_config(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
+
+    monkeypatch.setattr(h3, "ColumnParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    qkv_name = "blocks.0.attn.qkv_proj"
+    quant_config = DiffusionFp8Config()
+    model = h3.MiniMaxH3DiTModel(
+        _small_od_config(cache_config={"minimax_h3_fused_adaln_qkv": True}),
+        quant_config=quant_config,
+    )
+
+    assert model.fuse_adaln_qkv is True
+    assert model.blocks[0].attn.fuse_adaln_qkv is True
+    assert model.blocks[0].attn.qkv_proj.quant_config is quant_config
+    assert qkv_name not in quant_config.ignored_layers
 
 
 class _WeightTarget(nn.Module):

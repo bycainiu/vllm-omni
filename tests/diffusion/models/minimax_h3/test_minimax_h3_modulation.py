@@ -14,6 +14,8 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
     indexed_gate_rms_norm_scale_shift,
     indexed_scale_shift_,
     rms_norm_indexed_scale_shift,
+    rms_norm_indexed_scale_shift_fp8,
+    rms_norm_indexed_scale_shift_qkv,
 )
 from vllm_omni.platforms import current_omni_platform
 
@@ -218,3 +220,62 @@ def test_fused_modulation_keeps_fp32_affine_intermediates(fused_gate: bool) -> N
     # and rounds down to 1.2265625. Premature BF16 rounding drops the epsilon
     # and instead rounds the tie up to 1.234375, changing every output row.
     assert torch.equal(actual, torch.full_like(x, 1.2265625))
+
+
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_fused_rms_adaln_qkv_matches_materialized_input() -> None:
+    torch.manual_seed(29)
+    rows, hidden_size, conditions = 19, 512, 6
+    dtype = torch.bfloat16
+    x = torch.randn(rows, hidden_size, device="cuda", dtype=dtype)
+    norm_weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+    shift = torch.randn(conditions, hidden_size, device="cuda", dtype=dtype)
+    scale = torch.randn_like(shift)
+    indices = torch.arange(rows, device="cuda") % conditions
+    qkv_weight = torch.randn(3 * hidden_size, hidden_size, device="cuda", dtype=dtype)
+    eps = 1e-6
+
+    materialized = rms_norm_indexed_scale_shift(x, norm_weight, shift, scale, indices, eps)
+    expected = torch.nn.functional.linear(materialized, qkv_weight)
+    actual = rms_norm_indexed_scale_shift_qkv(x, norm_weight, shift, scale, indices, eps, qkv_weight)
+
+    # Triton and cuBLAS accumulate BF16 products in different K orders.
+    torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.02)
+
+
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_fused_rms_adaln_fp8_matches_materialized_per_token_quantization() -> None:
+    torch.manual_seed(31)
+    rows, hidden_size, conditions = 23, 512, 6
+    x = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+    shift = torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn_like(shift)
+    indices = torch.arange(rows, device="cuda") % conditions
+    eps = 1e-6
+
+    materialized = rms_norm_indexed_scale_shift(x, norm_weight, shift, scale, indices, eps)
+    expected_bf16 = materialized.float()
+    absmax = expected_bf16.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    expected_scale = absmax * (1.0 / torch.finfo(torch.float8_e4m3fn).max)
+    expected_fp8 = (
+        expected_bf16 / expected_scale
+    ).clamp(torch.finfo(torch.float8_e4m3fn).min, torch.finfo(torch.float8_e4m3fn).max).to(
+        torch.float8_e4m3fn
+    )
+
+    actual_fp8, actual_scale = rms_norm_indexed_scale_shift_fp8(
+        x,
+        norm_weight,
+        shift,
+        scale,
+        indices,
+        eps,
+    )
+
+    assert torch.equal(actual_fp8, expected_fp8)
+    torch.testing.assert_close(actual_scale, expected_scale, atol=0, rtol=0)

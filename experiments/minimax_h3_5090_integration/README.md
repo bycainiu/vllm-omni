@@ -130,6 +130,25 @@ identical output hashes. This is the historical evidence for enabling both
 changes together. It is TP4×USP2 evidence; the current TP2×USP4 stack has not
 been rebenchmarked.
 
+## AdaLN-QKV tile64 / 4-warps kernel
+
+The [opt-in config](configs/adaln-qkv.json) layers fused AdaLN-QKV on the
+FP8 + DLO + pruning stack. For BF16 QKV weights, the fused Triton kernel uses
+`BLOCK_M/N/K=64` and four warps. Offline FP8 QKV weights take a separate path:
+fused RMSNorm/AdaLN with per-row FP8 activation quantization followed by
+CUTLASS FP8 scaled-MM. That path keeps QKV weights FP8; it does not run the
+BF16 tile64 GEMM.
+
+This feature remains opt-in. Historical tile64 results were mixed: a 4-card
+TP4×USP1 test improved denoise and E2E by 3.8% with identical output, while a
+later 8-card BF16 integration run with AdaLN pruning regressed denoise by
+18.4%. The full-FP8 adaptation regressed denoise by 46.0% and changed output
+quality (SSIM 0.9669, PSNR 38.0959 dB against its unfused FP8 control). The
+4-card gain did not transfer to the full-FP8 8-card path, so this option is
+excluded from the default combined config until a matched TP2×USP4 run shows
+otherwise. Historical modulation and quantization tests passed on the source
+revision recorded in the experiment history; they have not been rerun here.
+
 ### Validation record
 
 - `bash -n` and local dry runs passed for the default TP2×USP4/DLO50 configuration
@@ -142,6 +161,8 @@ been rebenchmarked.
   source; this branch has not rerun them.
 - CPU/Gloo cancellation and strict QKV A2A equivalence tests passed on their
   recorded source; they have not been rerun on this ordered stack.
+- AdaLN-QKV tile64 and FP8 adaptation tests passed on their recorded source;
+  they have not been rerun on this ordered stack.
 - The selected CLI flags match prior H3 5090 server launches. Per the current
   instruction, this reorganization does not start a new GPU server; the new
   stack will not be described as end-to-end revalidated until such a run is

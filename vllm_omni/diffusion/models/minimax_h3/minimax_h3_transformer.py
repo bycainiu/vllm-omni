@@ -51,6 +51,8 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
     indexed_gate_rms_norm_scale_shift,
     indexed_scale_shift_,
     rms_norm_indexed_scale_shift,
+    rms_norm_indexed_scale_shift_fp8,
+    rms_norm_indexed_scale_shift_qkv,
 )
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -105,6 +107,21 @@ def _validate_adaln_pruning_quantization(
             "AdaLN weight pruning requires exact unquantized AdaLN projections; "
             f"quantized or unsupported projections: {quantized[:4]}"
         )
+
+
+def _get_cutlass_fp8_scaled_mm_kernel(linear: nn.Module) -> Any | None:
+    """Return vLLM's CUTLASS FP8 scaled-MM backend when the layer uses it."""
+    quant_method = getattr(linear, "quant_method", None)
+    fp8_linear = getattr(quant_method, "fp8_linear", None)
+    if fp8_linear is None:
+        return None
+    try:
+        from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+            CutlassFP8ScaledMMLinearKernel,
+        )
+    except ImportError:
+        return None
+    return fp8_linear if isinstance(fp8_linear, CutlassFP8ScaledMMLinearKernel) else None
 
 
 if TYPE_CHECKING:
@@ -470,6 +487,7 @@ class MiniMaxH3Attention(nn.Module):
         role: str = "self",
         role_category: str | None = None,
         skip_sequence_parallel: bool = False,
+        fuse_adaln_qkv: bool = False,
     ) -> None:
         super().__init__()
         self.total_num_heads = arch.num_attention_heads
@@ -487,6 +505,7 @@ class MiniMaxH3Attention(nn.Module):
             prefix=f"{prefix}.qkv_proj",
             return_bias=True,
         )
+        self._qkv_fp8_scaled_mm = _get_cutlass_fp8_scaled_mm_kernel(self.qkv_proj)
         self.num_heads = self.qkv_proj.num_heads
         self.num_kv_heads = self.qkv_proj.num_kv_heads
         self.rot_dim = 6 * arch.rope_inv_freq_len
@@ -512,6 +531,8 @@ class MiniMaxH3Attention(nn.Module):
         # VDN-H3 hybrid attention; built by enable_vdn for a VDN checkpoint.
         self.vdn: VDNH3HybridAttention | None = None
         self._prefix = prefix
+        self.fuse_adaln_qkv = fuse_adaln_qkv
+        self._reported_adaln_qkv_path = False
         from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
 
         self.attention = Attention(
@@ -709,6 +730,7 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         vdn_window: VDNLayout | None = None,
+        adaln_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -722,7 +744,102 @@ class MiniMaxH3Attention(nn.Module):
         all-to-all restores the row shard before the output projection.
         """
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x)
+        fused_qkv_path = None
+        if adaln_modulation is not None:
+            norm_weight, shift, scale, indices, eps = adaln_modulation
+            qkv_weight = self.qkv_proj.weight
+            qkv_fp8_scaled_mm = getattr(self, "_qkv_fp8_scaled_mm", None)
+            fused_bf16_qkv = (
+                self.fuse_adaln_qkv
+                and x.device.type == "cuda"
+                and x.dtype == torch.bfloat16
+                and x.is_contiguous()
+                and norm_weight.is_contiguous()
+                and qkv_weight.dtype == torch.bfloat16
+                and qkv_weight.is_contiguous()
+                and getattr(self.qkv_proj, "bias", None) is None
+                and self.to_gate_compress is None
+                and self.vdn is None
+                and not self.qkv_proj._forward_hooks
+                and not self.qkv_proj._forward_pre_hooks
+                and not x.requires_grad
+                and not torch.compiler.is_compiling()
+            )
+            qkv_weight_scale = getattr(self.qkv_proj, "weight_scale", None)
+            fused_fp8_qkv = (
+                self.fuse_adaln_qkv
+                and x.device.type == "cuda"
+                and x.dtype == torch.bfloat16
+                and x.is_contiguous()
+                and norm_weight.is_contiguous()
+                and shift.is_contiguous()
+                and scale.is_contiguous()
+                and indices.is_contiguous()
+                and qkv_weight.dtype == torch.float8_e4m3fn
+                and qkv_weight_scale is not None
+                and qkv_fp8_scaled_mm is not None
+                and getattr(self.qkv_proj, "bias", None) is None
+                and self.to_gate_compress is None
+                and self.vdn is None
+                and not self.qkv_proj._forward_hooks
+                and not self.qkv_proj._forward_pre_hooks
+                and not x.requires_grad
+                and not torch.compiler.is_compiling()
+            )
+            if fused_bf16_qkv:
+                fused_qkv_path = "bf16_direct_gemm"
+            elif fused_fp8_qkv:
+                fused_qkv_path = "fp8_activation_quant_cutlass_scaled_mm"
+            if self.fuse_adaln_qkv and not self._reported_adaln_qkv_path and self._prefix.endswith("blocks.0.attn"):
+                logger.info(
+                    "MiniMax H3 block-0 AdaLN-QKV fusion path selected=%s path=%s (activation_contiguous=%s, "
+                    "activation_shape=%s, qkv_weight_shape=%s, qkv_weight_contiguous=%s, "
+                    "qkv_weight_dtype=%s, fp8_kernel=%s, hooks=%s/%s)",
+                    fused_qkv_path is not None,
+                    fused_qkv_path or "regular_linear_fallback",
+                    x.is_contiguous(),
+                    tuple(x.shape),
+                    tuple(qkv_weight.shape),
+                    qkv_weight.is_contiguous(),
+                    qkv_weight.dtype,
+                    type(qkv_fp8_scaled_mm).__name__ if qkv_fp8_scaled_mm is not None else None,
+                    len(self.qkv_proj._forward_pre_hooks),
+                    len(self.qkv_proj._forward_hooks),
+                )
+                self._reported_adaln_qkv_path = True
+            if fused_bf16_qkv:
+                qkv = rms_norm_indexed_scale_shift_qkv(
+                    x,
+                    norm_weight,
+                    shift,
+                    scale,
+                    indices,
+                    eps,
+                    qkv_weight,
+                )
+            elif fused_fp8_qkv:
+                quantized_activation, activation_scale = rms_norm_indexed_scale_shift_fp8(
+                    x,
+                    norm_weight,
+                    shift,
+                    scale,
+                    indices,
+                    eps,
+                )
+                qkv = qkv_fp8_scaled_mm.apply_scaled_mm(
+                    A=quantized_activation,
+                    B=qkv_weight,
+                    out_dtype=x.dtype,
+                    As=activation_scale,
+                    Bs=qkv_weight_scale,
+                    bias=None,
+                    output_shape=[total, qkv_weight.shape[1]],
+                )
+            else:
+                x = rms_norm_indexed_scale_shift(x, norm_weight, shift, scale, indices, eps)
+                qkv, _ = self.qkv_proj(x)
+        else:
+            qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -1057,6 +1174,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         prefix: str,
         adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
+        fuse_adaln_qkv: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -1067,6 +1185,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            fuse_adaln_qkv=fuse_adaln_qkv,
         )
         self.mlp = MiniMaxH3MLP(
             arch,
@@ -1116,26 +1235,47 @@ class MiniMaxH3DiTBlock(nn.Module):
         ) = self.adaln_proj(t_emb)
 
         residual = x
-        h = rms_norm_indexed_scale_shift(
-            x,
-            self.norm1.weight,
-            shift_msa,
-            scale_msa,
-            combined_indices,
-            self.norm1.variance_epsilon,
-        )
-        h = self.attn(
-            h,
-            rope_table=rope_table,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            packed_total=packed_total,
-            num_requests=num_requests,
-            sp_seq_lens=sp_seq_lens,
-            video_layout=video_layout,
-            vsa_prefix_segments=vsa_prefix_segments,
-            vdn_window=vdn_window,
-        )
+        if self.attn.fuse_adaln_qkv:
+            h = self.attn(
+                x,
+                rope_table=rope_table,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                packed_total=packed_total,
+                num_requests=num_requests,
+                sp_seq_lens=sp_seq_lens,
+                video_layout=video_layout,
+                vsa_prefix_segments=vsa_prefix_segments,
+                vdn_window=vdn_window,
+                adaln_modulation=(
+                    self.norm1.weight,
+                    shift_msa,
+                    scale_msa,
+                    combined_indices,
+                    self.norm1.variance_epsilon,
+                ),
+            )
+        else:
+            h = rms_norm_indexed_scale_shift(
+                x,
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                self.norm1.variance_epsilon,
+            )
+            h = self.attn(
+                h,
+                rope_table=rope_table,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                packed_total=packed_total,
+                num_requests=num_requests,
+                sp_seq_lens=sp_seq_lens,
+                video_layout=video_layout,
+                vsa_prefix_segments=vsa_prefix_segments,
+                vdn_window=vdn_window,
+            )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
             gate_msa,
@@ -1373,10 +1513,28 @@ class MiniMaxH3DiTModel(nn.Module):
             if isinstance(cache_config, Mapping)
             else getattr(cache_config, "minimax_h3_adaln_prune_min_steps", 50)
         )
+        fuse_adaln_qkv = (
+            cache_config.get("minimax_h3_fused_adaln_qkv", False)
+            if isinstance(cache_config, Mapping)
+            else getattr(cache_config, "minimax_h3_fused_adaln_qkv", False)
+        )
+        logger.info(
+            "MiniMax H3 AdaLN-QKV requested=%s (cache_config_type=%s, quant_config_type=%s)",
+            fuse_adaln_qkv,
+            type(cache_config).__name__,
+            type(quant_config).__name__ if quant_config is not None else None,
+        )
         if type(prune_adaln_weights) is not bool:
             raise ValueError("minimax_h3_adaln_prune_weights must be a boolean")
         if type(prune_min_steps) is not int or prune_min_steps < 1:
             raise ValueError("minimax_h3_adaln_prune_min_steps must be a positive integer")
+        if type(fuse_adaln_qkv) is not bool:
+            raise ValueError("minimax_h3_fused_adaln_qkv must be a boolean")
+        if fuse_adaln_qkv and quant_config is not None:
+            logger.info(
+                "MiniMax H3 fused AdaLN-QKV is enabled: BF16 uses direct fusion; "
+                "CUTLASS FP8 uses fused AdaLN activation quantization before the scaled-MM projection"
+            )
         enabled = (
             cache_config.get("minimax_h3_adaln_cache", True)
             if isinstance(cache_config, Mapping)
@@ -1436,6 +1594,9 @@ class MiniMaxH3DiTModel(nn.Module):
             prune_weights=prune_adaln_weights,
             prune_min_steps=prune_min_steps,
         )
+        self.fuse_adaln_qkv = fuse_adaln_qkv
+        if fuse_adaln_qkv:
+            logger.info("MiniMax H3 fused AdaLN-QKV path enabled")
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.hidden_size = arch.hidden_size
@@ -1500,6 +1661,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     quant_config,
                     prefix=f"blocks.{i}",
                     adaln_cache=self.adaln_cache,
+                    fuse_adaln_qkv=self.fuse_adaln_qkv,
                 )
                 for i in range(arch.num_layers)
             ]
