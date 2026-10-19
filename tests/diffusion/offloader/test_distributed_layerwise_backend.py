@@ -803,6 +803,149 @@ class TestPinnedResidentLayerGroup:
 
         group.offload()
 
+    def test_staged_dma_resident_path_alternates_pinned_slots(self, patched_offload_runtime, monkeypatch):
+        blocks = [nn.Linear(2, 2) for _ in range(3)]
+        expected = []
+        for index, block in enumerate(blocks):
+            block.weight.data.fill_(index + 1)
+            expected.append(block.weight.detach().clone())
+
+        group = PinnedResidentLayerGroup(
+            blocks,
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            pin_memory=False,
+            staged_dma=True,
+        )
+        recorded_ranges: list[str] = []
+        original_record_function = torch.profiler.record_function
+
+        def record_function(name: str):
+            recorded_ranges.append(name)
+            return original_record_function(name)
+
+        monkeypatch.setattr(torch.profiler, "record_function", record_function)
+
+        group.load()
+
+        assert len(group._cpu_staging_buffers) == 2
+        assert [name for name in recorded_ranges if name.startswith("PinnedDMA/stage_to_pinned/")] == [
+            "PinnedDMA/stage_to_pinned/slot0",
+            "PinnedDMA/stage_to_pinned/slot1",
+            "PinnedDMA/stage_to_pinned/slot0",
+        ]
+        assert [name for name in recorded_ranges if name.startswith("PinnedDMA/h2d/")] == [
+            "PinnedDMA/h2d/slot0",
+            "PinnedDMA/h2d/slot1",
+            "PinnedDMA/h2d/slot0",
+        ]
+        for block, weight in zip(blocks, expected, strict=True):
+            torch.testing.assert_close(block.weight, weight)
+        group.offload()
+
+    def test_staged_dma_skips_recopy_for_pinned_resident_shards(self, patched_offload_runtime, monkeypatch):
+        monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+        blocks = [nn.Linear(2, 2) for _ in range(2)]
+        expected = [block.weight.detach().clone() for block in blocks]
+        group = PinnedResidentLayerGroup(
+            blocks,
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            pin_memory=False,
+            staged_dma=True,
+        )
+        assert group._cpu_staging_buffers == []
+
+        recorded_ranges: list[str] = []
+        original_record_function = torch.profiler.record_function
+
+        def record_function(name: str):
+            recorded_ranges.append(name)
+            return original_record_function(name)
+
+        monkeypatch.setattr(torch.profiler, "record_function", record_function)
+        group.load()
+
+        assert [name for name in recorded_ranges if name.startswith("PinnedDMA/stage_to_pinned/")] == []
+        assert [name for name in recorded_ranges if name.startswith("PinnedDMA/h2d_direct/")] == [
+            "PinnedDMA/h2d_direct/slot0",
+            "PinnedDMA/h2d_direct/slot1",
+        ]
+        for block, weight in zip(blocks, expected, strict=True):
+            torch.testing.assert_close(block.weight, weight)
+        group.offload()
+
+    def test_pipeline_staged_dma_flag_is_discovered_by_dlo(self):
+        pipeline = nn.Module()
+        transformer = nn.Module()
+        transformer._staged_dma_enabled = True
+        pipeline.add_module("transformer", transformer)
+
+        assert DistributedLayerwiseOffloadBackend._pipeline_requests_staged_dma(pipeline)
+
+    def test_staged_dma_streaming_hook_uses_pinned_slot(self, patched_offload_runtime, monkeypatch):
+        current_block = nn.Linear(2, 2, bias=False)
+        next_block = nn.Linear(2, 2, bias=False)
+        next_block.weight.data.copy_(torch.arange(4, dtype=torch.float32).view(2, 2))
+        expected = next_block.weight.detach().clone()
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+            staged_dma=True,
+        )
+        hook.initialize_hook(current_block)
+        hook._allocate_device_buffers()
+        hook.cpu_staging_buffers = [
+            {torch.float32: torch.empty(4)},
+            {torch.float32: torch.empty(4)},
+        ]
+        recorded_ranges: list[str] = []
+        original_record_function = torch.profiler.record_function
+
+        def record_function(name: str):
+            recorded_ranges.append(name)
+            return original_record_function(name)
+
+        monkeypatch.setattr(torch.profiler, "record_function", record_function)
+        hook.prefetch_layer(slot=0, non_blocking=False)
+
+        torch.testing.assert_close(next_block.weight, expected)
+        assert recorded_ranges == ["PinnedDMA/stage_to_pinned/slot0", "PinnedDMA/h2d/slot0"]
+
+    def test_staged_dma_streaming_hook_directly_transfers_pinned_shards(self, patched_offload_runtime, monkeypatch):
+        monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+        current_block = nn.Linear(2, 2, bias=False)
+        next_block = nn.Linear(2, 2, bias=False)
+        next_block.weight.data.copy_(torch.arange(4, dtype=torch.float32).view(2, 2))
+        expected = next_block.weight.detach().clone()
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+            staged_dma=True,
+        )
+        hook.initialize_hook(current_block)
+        hook._allocate_device_buffers()
+        recorded_ranges: list[str] = []
+        original_record_function = torch.profiler.record_function
+
+        def record_function(name: str):
+            recorded_ranges.append(name)
+            return original_record_function(name)
+
+        monkeypatch.setattr(torch.profiler, "record_function", record_function)
+        hook.prefetch_layer(slot=0, non_blocking=False)
+
+        torch.testing.assert_close(next_block.weight, expected)
+        assert recorded_ranges == ["PinnedDMA/h2d_direct/slot0"]
+
     def test_load_preserves_noncontiguous_weight_stride(self, patched_offload_runtime):
         block = nn.Module()
         weight = torch.arange(6, dtype=torch.float32).reshape(2, 3).t()

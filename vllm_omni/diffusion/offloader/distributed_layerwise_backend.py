@@ -21,6 +21,7 @@ from __future__ import annotations
 import threading
 import time
 import weakref
+from contextlib import nullcontext
 from collections.abc import Sequence
 from itertools import chain
 from typing import Any
@@ -73,6 +74,11 @@ from .tensor_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _cpu_shards_need_staging(cpu_shards: dict[torch.dtype, torch.Tensor]) -> bool:
+    """Return whether any CPU shard needs copying into pinned host memory."""
+    return any(tensor.numel() and not tensor.is_pinned() for tensor in cpu_shards.values())
 
 # A backend normally owns both objects below. This process-lifetime safety
 # owner prevents HostWeightLease.__del__ from unmapping storage when cleanup
@@ -137,6 +143,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         pin_memory: bool = True,
         shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
         rank_local_mmap: bool = False,
+        staged_dma: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
         materialization_probe_tensor: torch.Tensor | None = None,
     ):
@@ -157,6 +164,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.rank = rank
         self.pin_memory = pin_memory
         self.rank_local_mmap = rank_local_mmap
+        self.staged_dma = staged_dma
         self.registered_mmap = False
         self.tensor_transforms = tensor_transforms or {}
         self._materialization_probe = materialization_probe_tensor
@@ -181,9 +189,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.cpu_sources: dict[torch.dtype, list[dict[str, Any]]] = {}
         self.metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
 
-        # Rank-local mmap uses two host staging slots shared by every hook in
-        # this worker.  They are assigned by the backend after all block sizes
-        # are known, mirroring the shared device-buffer allocation.
+        # Rank-local mmap and pageable sources use two host slots shared by
+        # every hook in this worker. The backend assigns them after all block
+        # sizes are known, mirroring shared device-buffer allocation.
         self.cpu_staging_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
         self.cpu_staging_events: list[Any | None] = [None, None]
 
@@ -495,7 +503,13 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         slot_buffers = self.cpu_staging_buffers[slot]
         if slot_buffers is None:
             raise RuntimeError(f"cpu_staging_buffers[{slot}] was not allocated")
-        return self._pack_mmap_sources(self.cpu_sources, self.metadata, slot_buffers)
+        range_context = (
+            torch.profiler.record_function(f"PinnedDMA/stage_to_pinned/slot{slot}")
+            if self.staged_dma
+            else nullcontext()
+        )
+        with range_context:
+            return self._pack_mmap_sources(self.cpu_sources, self.metadata, slot_buffers)
 
     @staticmethod
     def _copy_mmap_sources_to_device(
@@ -538,7 +552,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         assert gpu_weights is not None, f"gpu_buffers[{slot}] not allocated"
 
         if self.dp_size <= 1 or self.dp_group is None:
-            if self.rank_local_mmap and self.registered_mmap:
+            if self.rank_local_mmap and self.registered_mmap and not self.staged_dma:
                 with current_omni_platform.stream(self.copy_stream):
                     self._copy_mmap_sources_to_device(
                         self.cpu_sources,
@@ -549,13 +563,47 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     evt.record(self.copy_stream)
             else:
                 cpu_weights = self._stage_mmap_sources(slot) if self.rank_local_mmap else self.cpu_shards
+                staging_used = self.staged_dma and (
+                    self.rank_local_mmap or _cpu_shards_need_staging(cpu_weights)
+                )
+                if staging_used and not self.rank_local_mmap:
+                    previous_copy = self.cpu_staging_events[slot]
+                    if previous_copy is not None:
+                        synchronize = getattr(previous_copy, "synchronize", None)
+                        if callable(synchronize):
+                            synchronize()
+                        else:
+                            current_omni_platform.synchronize()
+                    slot_buffers = self.cpu_staging_buffers[slot]
+                    if slot_buffers is None:
+                        raise RuntimeError(f"cpu_staging_buffers[{slot}] was not allocated")
+                    staged_weights: dict[torch.dtype, torch.Tensor] = {}
+                    range_context = torch.profiler.record_function(f"PinnedDMA/stage_to_pinned/slot{slot}")
+                    with range_context:
+                        for dtype, cpu_shard in cpu_weights.items():
+                            if cpu_shard.is_pinned():
+                                staged_weights[dtype] = cpu_shard
+                            else:
+                                staged = slot_buffers[dtype][: cpu_shard.numel()]
+                                staged.copy_(cpu_shard)
+                                staged_weights[dtype] = staged
+                    cpu_weights = staged_weights
                 with current_omni_platform.stream(self.copy_stream):
-                    for dtype, cpu_shard in cpu_weights.items():
-                        gw = gpu_weights[dtype]
-                        async_copy = non_blocking and cpu_shard.is_pinned()
-                        gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=async_copy)
+                    range_name = (
+                        f"PinnedDMA/h2d/slot{slot}"
+                        if staging_used
+                        else f"PinnedDMA/h2d_direct/slot{slot}" if self.staged_dma else None
+                    )
+                    range_context = (
+                        torch.profiler.record_function(range_name) if range_name else nullcontext()
+                    )
+                    with range_context:
+                        for dtype, cpu_shard in cpu_weights.items():
+                            gw = gpu_weights[dtype]
+                            async_copy = non_blocking and cpu_shard.is_pinned()
+                            gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=async_copy)
                     evt.record(self.copy_stream)
-                if self.rank_local_mmap:
+                if self.rank_local_mmap or staging_used:
                     # The CPU slot may be overwritten only after this H2D copy has
                     # finished.  The shared event protects reuse by another hook.
                     self.cpu_staging_events[slot] = evt
@@ -563,11 +611,46 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             gpu_shards: dict[torch.dtype, torch.Tensor] = {}
             shard_bufs = self.gpu_shard_buffers[slot]
             assert shard_bufs is not None, f"gpu_shard_buffers[{slot}] not allocated"
+            cpu_shards = self.cpu_shards
+            staging_used = self.staged_dma and _cpu_shards_need_staging(cpu_shards)
+            if staging_used:
+                previous_copy = self.cpu_staging_events[slot]
+                if previous_copy is not None:
+                    synchronize = getattr(previous_copy, "synchronize", None)
+                    if callable(synchronize):
+                        synchronize()
+                    else:
+                        current_omni_platform.synchronize()
+                slot_buffers = self.cpu_staging_buffers[slot]
+                if slot_buffers is None:
+                    raise RuntimeError(f"cpu_staging_buffers[{slot}] was not allocated")
+                staged_shards: dict[torch.dtype, torch.Tensor] = {}
+                range_context = torch.profiler.record_function(f"PinnedDMA/stage_to_pinned/slot{slot}")
+                with range_context:
+                    for dtype, cpu_shard in cpu_shards.items():
+                        if cpu_shard.is_pinned():
+                            staged_shards[dtype] = cpu_shard
+                        else:
+                            staged = slot_buffers[dtype][: cpu_shard.numel()]
+                            staged.copy_(cpu_shard)
+                            staged_shards[dtype] = staged
+                cpu_shards = staged_shards
+            copy_done = current_omni_platform.Event()
             with current_omni_platform.stream(self.copy_stream):
-                for dtype, cpu_shard in self.cpu_shards.items():
-                    gpu_shard = shard_bufs[dtype][: cpu_shard.numel()]
-                    gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
-                    gpu_shards[dtype] = gpu_shard
+                range_name = (
+                    f"PinnedDMA/h2d/slot{slot}"
+                    if staging_used
+                    else f"PinnedDMA/h2d_direct/slot{slot}" if self.staged_dma else None
+                )
+                range_context = torch.profiler.record_function(range_name) if range_name else nullcontext()
+                with range_context:
+                    for dtype, cpu_shard in cpu_shards.items():
+                        gpu_shard = shard_bufs[dtype][: cpu_shard.numel()]
+                        gpu_shard.copy_(cpu_shard, non_blocking=non_blocking and cpu_shard.is_pinned())
+                        gpu_shards[dtype] = gpu_shard
+                copy_done.record(self.copy_stream)
+            if staging_used:
+                self.cpu_staging_events[slot] = copy_done
 
             self.comm_stream.wait_stream(self.copy_stream)
             with current_omni_platform.stream(self.comm_stream):
@@ -744,6 +827,7 @@ def apply_distributed_block_hook(
     pin_memory: bool = True,
     shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
     rank_local_mmap: bool = False,
+    staged_dma: bool = False,
     tensor_transforms: dict[int, Any] | None = None,
     materialization_probe_tensor: torch.Tensor | None = None,
 ) -> DistributedLayerwiseOffloadHook:
@@ -760,6 +844,7 @@ def apply_distributed_block_hook(
         pin_memory=pin_memory,
         shared_buffers=shared_buffers,
         rank_local_mmap=rank_local_mmap,
+        staged_dma=staged_dma,
         tensor_transforms=tensor_transforms,
         materialization_probe_tensor=materialization_probe_tensor,
     )
@@ -785,7 +870,8 @@ class PinnedResidentLayerGroup:
     Unlike ``module.to(device)``/``module.to("cpu")``, this group retains a
     pinned CPU master copy (or mmap source plus bounded staging) and never
     copies generated device weights back to host. Entering the denoise stage
-    performs one asynchronous H2D pass;
+    performs one asynchronous H2D pass. MiniMax H3's staged-DMA option packs
+    ordinary CPU shards through two bounded pinned slots before that pass;
     leaving it only restores zero-sized placeholders and releases the device
     buffers.  This lets the following VAE stage reuse the same HBM.
 
@@ -802,12 +888,14 @@ class PinnedResidentLayerGroup:
         pin_memory: bool,
         rank_local_mmap: bool = False,
         defer_staging: bool = False,
+        staged_dma: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
         self.loaded = False
         self.rank_local_mmap = rank_local_mmap
+        self.staged_dma = staged_dma
         self.registered_mmap = False
         self.pin_memory = pin_memory
         self._states: list[dict[str, Any]] = []
@@ -845,7 +933,11 @@ class PinnedResidentLayerGroup:
 
         self._cpu_staging_buffers: list[dict[torch.dtype, torch.Tensor]] = []
         self._cpu_staging_events: list[Any | None] = [None, None]
-        if rank_local_mmap and not defer_staging:
+        needs_staging = rank_local_mmap or (
+            staged_dma
+            and any(_cpu_shards_need_staging(state["cpu_shards"]) for state in self._states)
+        )
+        if needs_staging and not defer_staging:
             max_sizes: dict[torch.dtype, int] = {}
             for state in self._states:
                 for dtype, metas in state["metadata"].items():
@@ -887,7 +979,7 @@ class PinnedResidentLayerGroup:
         ready = current_omni_platform.Event()
         with current_omni_platform.stream(self.copy_stream):
             for index, (state, block_buffers) in enumerate(zip(self._states, gpu_buffers)):
-                if self.rank_local_mmap and self.registered_mmap:
+                if self.rank_local_mmap and self.registered_mmap and not self.staged_dma:
                     DistributedLayerwiseOffloadHook._copy_mmap_sources_to_device(
                         state["cpu_sources"],
                         state["metadata"],
@@ -904,13 +996,75 @@ class PinnedResidentLayerGroup:
                             synchronize()
                         else:
                             current_omni_platform.synchronize()
-                    cpu_weights = DistributedLayerwiseOffloadHook._pack_mmap_sources(
-                        state["cpu_sources"],
-                        state["metadata"],
-                        self._cpu_staging_buffers[slot],
-                    )
+                    if self.staged_dma:
+                        with torch.profiler.record_function(f"PinnedDMA/stage_to_pinned/slot{slot}"):
+                            cpu_weights = DistributedLayerwiseOffloadHook._pack_mmap_sources(
+                                state["cpu_sources"],
+                                state["metadata"],
+                                self._cpu_staging_buffers[slot],
+                            )
+                    else:
+                        cpu_weights = DistributedLayerwiseOffloadHook._pack_mmap_sources(
+                            state["cpu_sources"],
+                            state["metadata"],
+                            self._cpu_staging_buffers[slot],
+                        )
                 else:
                     cpu_weights = state["cpu_shards"]
+
+                staging_used = self.staged_dma and (
+                    self.rank_local_mmap or _cpu_shards_need_staging(cpu_weights)
+                )
+                if staging_used:
+                    slot = index % 2
+                    if not self.rank_local_mmap:
+                        previous_copy = self._cpu_staging_events[slot]
+                        if previous_copy is not None:
+                            synchronize = getattr(previous_copy, "synchronize", None)
+                            if callable(synchronize):
+                                synchronize()
+                            else:
+                                current_omni_platform.synchronize()
+
+                    slot_buffers = self._cpu_staging_buffers[slot]
+                    if slot_buffers is None:
+                        raise RuntimeError(f"cpu_staging_buffers[{slot}] was not allocated")
+                    staged_weights: dict[torch.dtype, torch.Tensor] = {}
+                    if self.rank_local_mmap:
+                        # _pack_mmap_sources already packs directly into this
+                        # pinned slot; copying it a second time would only add
+                        # CPU traffic.
+                        staged_weights = cpu_weights
+                    else:
+                        with torch.profiler.record_function(f"PinnedDMA/stage_to_pinned/slot{slot}"):
+                            for dtype, cpu_weight in cpu_weights.items():
+                                if cpu_weight.is_pinned():
+                                    staged_weights[dtype] = cpu_weight
+                                else:
+                                    staged = slot_buffers[dtype][: cpu_weight.numel()]
+                                    staged.copy_(cpu_weight)
+                                    staged_weights[dtype] = staged
+
+                    with torch.profiler.record_function(f"PinnedDMA/h2d/slot{slot}"):
+                        for dtype, staged_weight in staged_weights.items():
+                            block_buffers[dtype].copy_(
+                                staged_weight,
+                                non_blocking=staged_weight.is_pinned(),
+                            )
+                    slot_ready = current_omni_platform.Event()
+                    slot_ready.record(self.copy_stream)
+                    self._cpu_staging_events[slot] = slot_ready
+                    continue
+
+                if self.staged_dma:
+                    slot = index % 2
+                    with torch.profiler.record_function(f"PinnedDMA/h2d_direct/slot{slot}"):
+                        for dtype, cpu_weight in cpu_weights.items():
+                            block_buffers[dtype].copy_(
+                                cpu_weight,
+                                non_blocking=cpu_weight.is_pinned(),
+                            )
+                    continue
 
                 for dtype, cpu_weight in cpu_weights.items():
                     block_buffers[dtype].copy_(
@@ -1029,6 +1183,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._host_registration: HostRegistration | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
         self._poisoned_reason: str | None = None
+        self._staged_dma_enabled = False
+
+    @staticmethod
+    def _pipeline_requests_staged_dma(pipeline: nn.Module) -> bool:
+        """Read the H3 cache flag where DLO can honor it at the real H2D site."""
+        return any(bool(getattr(module, "_staged_dma_enabled", False)) for module in pipeline.modules())
 
     def load_resident_layers(self) -> None:
         """Load the model-declared leading blocks for the denoise stage."""
@@ -1148,6 +1308,21 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             or plan is None
             or plan.backing_kind != "host_weight_runtime"
         ):
+            return
+
+        if self._staged_dma_enabled:
+            # The H3 opt-in specifically measures the two-slot pinned staging
+            # path. Leave the HWR source on its host mapping and let the
+            # resident group pack it into bounded pinned slots before DMA.
+            self._using_registered_mmap = False
+            for hook in hooks:
+                hook.registered_mmap = False
+            if self._resident_layer_group is not None:
+                self._resident_layer_group.registered_mmap = False
+            logger.info(
+                "MiniMax H3 staged DMA enabled: using bounded two-slot pinned staging "
+                "on DLO CPU-to-CUDA transfers"
+            )
             return
 
         source_tensors = self._rank_local_source_tensors(hooks)
@@ -1465,6 +1640,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self.config.pin_cpu_memory,
                     shared_buffers=[None, None],
                     rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
+                    staged_dma=self._staged_dma_enabled,
                     tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
                     materialization_probe_tensor=probes[id(block)],
                 )
@@ -1618,6 +1794,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             logger.warning("DistributedLayerwiseOffloadBackend already enabled")
             return
 
+        self._staged_dma_enabled = self._pipeline_requests_staged_dma(pipeline)
+        if self._staged_dma_enabled:
+            if self.device.type != "cuda":
+                raise ValueError("MiniMax H3 staged DMA requires a CUDA DLO device")
+            if not self.config.pin_cpu_memory:
+                raise ValueError("MiniMax H3 staged DMA requires DLO pin_cpu_memory=True")
+            logger.info("MiniMax H3 staged DMA requested; inspecting DLO CPU sources before selecting transfers")
+
         # Initialize DP group (if not already done by early init)
         if self.dp_group is None and self._has_multirank_allgather():
             self._init_dp_group()
@@ -1729,6 +1913,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self.config.pin_cpu_memory,
                 rank_local_mmap=self._using_rank_local_mmap,
                 defer_staging=bool(self._all_hook_groups),
+                staged_dma=self._staged_dma_enabled,
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
             )
             pipeline._dlo_residency_controller = self
@@ -1752,9 +1937,21 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         unified_shard_buffers = self._allocate_shared_shard_buffers(allgather_hooks) if allgather_hooks else None
         unified_cpu_staging = None
         cpu_staging_events = None
-        if self._using_rank_local_mmap and not self._using_registered_mmap:
+        pageable_shards = False
+        if self._staged_dma_enabled:
+            pageable_shards = any(_cpu_shards_need_staging(hook.cpu_shards) for hook in all_hooks)
+            if self._resident_layer_group is not None:
+                pageable_shards = pageable_shards or any(
+                    _cpu_shards_need_staging(state["cpu_shards"])
+                    for state in self._resident_layer_group._states
+                )
+        needs_cpu_staging = (self._using_rank_local_mmap and not self._using_registered_mmap) or (
+            self._staged_dma_enabled and pageable_shards
+        )
+        if needs_cpu_staging:
+            staging_hooks = all_hooks if self._staged_dma_enabled else mmap_hooks
             unified_cpu_staging = self._allocate_shared_cpu_staging_buffers(
-                mmap_hooks,
+                staging_hooks,
                 self._resident_layer_group,
             )
             cpu_staging_events = [None, None]
@@ -1765,6 +1962,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     buffers for buffers in unified_cpu_staging if buffers is not None
                 ]
                 self._resident_layer_group._cpu_staging_events = cpu_staging_events
+        elif self._staged_dma_enabled:
+            logger.info(
+                "MiniMax H3 DLO CPU shards are already pinned; skipping redundant staging copies "
+                "and using direct asynchronous H2D"
+            )
 
         # Shared slot-group tracker: _shared_slot_group[slot] = group_id
         # that last wrote to that slot.  Group-first hooks use this to
@@ -1777,7 +1979,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 hook._owns_buffers = False
                 if unified_shard_buffers is not None and hook.dp_size > 1:
                     hook.gpu_shard_buffers = unified_shard_buffers
-                if hook.rank_local_mmap and unified_cpu_staging is not None and cpu_staging_events is not None:
+                if (
+                    (hook.rank_local_mmap or hook.staged_dma)
+                    and unified_cpu_staging is not None
+                    and cpu_staging_events is not None
+                ):
                     hook.cpu_staging_buffers = unified_cpu_staging
                     hook.cpu_staging_events = cpu_staging_events
                 hook._group_id = group_idx
@@ -2028,7 +2234,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         hooks: list[DistributedLayerwiseOffloadHook],
         resident_group: PinnedResidentLayerGroup | None = None,
     ) -> list[dict[torch.dtype, torch.Tensor] | None]:
-        """Allocate two bounded host slots for rank-local mmap -> device copies."""
+        """Allocate two bounded pinned host slots for staged DLO -> device copies."""
         max_sizes: dict[torch.dtype, int] = {}
         for hook in hooks:
             for dtype, metas in hook.metadata.items():
@@ -2055,7 +2261,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             shared_staging[slot] = buffers
 
         logger.info(
-            "Allocated 2 shared host staging buffers for rank-local mmap (max block size: %s, pinned=%s)",
+            "Allocated 2 shared host staging buffers (max block size: %s, pinned=%s)",
             {str(k): f"{v * _dtype_size(k) / 1024 / 1024:.1f}MB" for k, v in max_sizes.items()},
             pin_memory,
         )

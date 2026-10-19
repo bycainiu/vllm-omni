@@ -6,6 +6,7 @@ TP_SIZE="${MINIMAX_H3_TP_SIZE:-2}"
 USP_SIZE="${MINIMAX_H3_USP_SIZE:-4}"
 DLO_RESIDENT_LAYERS="${MINIMAX_H3_DLO_RESIDENT_LAYERS:-50}"
 TEXT_ENCODER_INIT_ON_CPU="${MINIMAX_H3_TEXT_ENCODER_INIT_ON_CPU:-0}"
+CACHE_CONFIG="${MINIMAX_H3_CACHE_CONFIG:-}"
 
 for value_name in TP_SIZE USP_SIZE DLO_RESIDENT_LAYERS; do
   value="${!value_name}"
@@ -70,6 +71,9 @@ COMMAND=(
   --diffusion-attention-backend CUDNN_ATTN
   --ulysses-mode strict
 )
+if [[ -n "$CACHE_CONFIG" ]]; then
+  COMMAND+=(--cache-config "$CACHE_CONFIG")
+fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf 'CUDA_VISIBLE_DEVICES=%q ' "$CUDA_VISIBLE_DEVICES"

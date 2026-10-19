@@ -63,12 +63,37 @@ combined result, not an isolated FP8 speedup. The comparison also had output
 quality differences (SSIM 0.8761, PSNR 28.568 dB against BF16). None of these
 historical runs is a revalidation of this new commit chain.
 
+## Pinned DMA with DLO
+
+Enable the model-side path through the same `cache_config` consumed by the H3
+DiT and DLO hooks:
+
+```bash
+MINIMAX_H3_CACHE_CONFIG='{"minimax_h3_staged_dma":true}' \
+./experiments/minimax_h3_5090_integration/run_server.sh
+```
+
+The implementation sends already pinned host shards directly to the GPU and
+uses alternating pinned staging slots only for pageable or rank-local mmap
+sources. It covers both resident-layer loading and streamed prefetch. The
+[historical DLO report](pinned-dma-results.md) confirms that the flag reached
+both paths on 8 GPUs, removed 50 unnecessary host copies per rank, and kept
+the 50 H2D copies / 16.14 GB per rank. The corrected profiled DLO host range
+was 47.9 ms per rank versus 3,742 ms in the earlier redundant-staging probe;
+these are instrumented diagnostic values. The single no-profiler timing run
+did not establish a repeatable end-to-end or denoise speedup over direct pinned
+H2D. Pinned DMA is therefore a transfer-path correctness/startup optimization,
+not a measured pure-denoise gain. Historical focused DLO and model-loader tests
+passed; they have not been rerun on this ordered stack.
+
 ### Validation record
 
 - `bash -n` and local dry runs passed for the default TP2×USP4/DLO50 configuration
   and TP4×USP2/DLO0. A TP2×USP4 configuration with `NUM_GPUS=4` was rejected.
 - The offline FP8 exporter and its targeted loader tests were previously
   validated on the recorded experiment source; this branch has not rerun them.
+- Pinned DMA's DLO and model-loader test suites passed on its recorded source;
+  this branch has not rerun them.
 - The selected CLI flags match prior H3 5090 server launches. Per the current
   instruction, this reorganization does not start a new GPU server; the new
   stack will not be described as end-to-end revalidated until such a run is

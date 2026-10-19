@@ -1292,6 +1292,17 @@ class MiniMaxH3DiTModel(nn.Module):
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
         cache_config = getattr(od_config, "cache_config", {})
+        staged_dma = (
+            cache_config.get("minimax_h3_staged_dma", False)
+            if isinstance(cache_config, Mapping)
+            else getattr(cache_config, "minimax_h3_staged_dma", False)
+        )
+        if type(staged_dma) is not bool:
+            raise ValueError("minimax_h3_staged_dma must be a boolean")
+        if staged_dma and not current_omni_platform.is_cuda():
+            raise ValueError("MiniMax H3 staged weight DMA requires CUDA")
+        self._staged_dma_enabled = staged_dma
+        self._staged_weight_stager = None
         enabled = (
             cache_config.get("minimax_h3_adaln_cache", True)
             if isinstance(cache_config, Mapping)
@@ -1533,6 +1544,26 @@ class MiniMaxH3DiTModel(nn.Module):
         diffusers_weights = getattr(self, "_diffusers_weights", False)
         qkv_parts: dict[str, set[str]] = {}
         source_names: set[str] = set()
+
+        def load_weight(param: torch.Tensor, source: torch.Tensor, *loader_args: Any) -> object:
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if (
+                not getattr(self, "_staged_dma_enabled", False)
+                or source.device.type != "cpu"
+                or param.device.type != "cuda"
+            ):
+                return weight_loader(param, source, *loader_args)
+            stager = getattr(self, "_staged_weight_stager", None)
+            if stager is None:
+                from vllm_omni.diffusion.model_loader.pinned_dma import DoubleBufferedPinnedStager
+
+                stager = DoubleBufferedPinnedStager(param.device)
+                self._staged_weight_stager = stager
+            return stager.submit(
+                source,
+                lambda staged: weight_loader(param, staged, *loader_args),
+            )
+
         for name, loaded_weight in weights:
             layout = "plain"
             if diffusers_weights:
@@ -1550,11 +1581,10 @@ class MiniMaxH3DiTModel(nn.Module):
                     raise ValueError(f"Diffusers H3 weight has no model parameter: {name}")
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
             if layout in {"q", "k", "v"}:
                 # vLLM can load each projection directly into its packed QKV
                 # parameter, including TP slicing and online quantization.
-                weight_loader(param, loaded_weight, layout)
+                load_weight(param, loaded_weight, layout)
                 qkv_parts.setdefault(name, set()).add(layout)
             elif name.endswith(".attn.qkv_proj.weight_scale"):
                 # The native checkpoint stores grouped [q, k, v] rows inside
@@ -1567,7 +1597,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     heads_per_group=1,
                     head_dim=self.arch.attention_head_dim,
                 )
-                weight_loader(param, loaded_weight)
+                load_weight(param, loaded_weight)
             elif name.endswith(".attn.qkv_proj.weight"):
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost.
@@ -1577,7 +1607,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     heads_per_group=1,
                     head_dim=self.arch.attention_head_dim,
                 )
-                weight_loader(param, loaded_weight)
+                load_weight(param, loaded_weight)
             elif name.endswith(".mlp.fc1.weight_scale"):
                 # MergedColumnParallelLinear stores gate and up scales in
                 # separate shards. The checkpoint concatenates those channels
@@ -1588,8 +1618,8 @@ class MiniMaxH3DiTModel(nn.Module):
                         f"gate/up vectors, got {tuple(loaded_weight.shape)}"
                     )
                 first, second = loaded_weight.chunk(2, dim=0)
-                weight_loader(param, first, 0)
-                weight_loader(param, second, 1)
+                load_weight(param, first, 0)
+                load_weight(param, second, 1)
             elif name.endswith(".mlp.fc1.weight"):
                 if loaded_weight.shape[0] % 2:
                     raise ValueError(
@@ -1598,10 +1628,10 @@ class MiniMaxH3DiTModel(nn.Module):
                     )
                 first, second = loaded_weight.chunk(2, dim=0)
                 gate, up = (second, first) if layout == "swap_halves" else (first, second)
-                weight_loader(param, gate, 0)
-                weight_loader(param, up, 1)
+                load_weight(param, gate, 0)
+                load_weight(param, up, 1)
             else:
-                weight_loader(param, loaded_weight)
+                load_weight(param, loaded_weight)
             loaded.add(name)
         if diffusers_weights:
             for name, parts in qkv_parts.items():
@@ -1614,8 +1644,12 @@ class MiniMaxH3DiTModel(nn.Module):
                 self._rope_theta
                 ** (torch.arange(0, 2 * freq_dim, 2, dtype=torch.float32, device="cpu") / (2 * freq_dim))
             )
-            default_weight_loader(params["rope.inv_freq"], rope)
+            load_weight(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
+        stager = getattr(self, "_staged_weight_stager", None)
+        if stager is not None:
+            stager.synchronize()
+            self._staged_weight_stager = None
         return loaded
 
     @staticmethod
