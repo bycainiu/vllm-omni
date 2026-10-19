@@ -19,6 +19,8 @@ environment variables:
 | `MINIMAX_H3_TEXT_ENCODER_INIT_ON_CPU` | `0` | Use the validated CPU construction path for FP8 startup |
 | `MINIMAX_H3_CACHE_CONFIG` | empty | JSON string passed as vLLM `--cache-config` |
 | `MINIMAX_H3_QKV_A2A_FUSION` | `1` | Use strict Ulysses QKV fusion; set `0` for control |
+| `MINIMAX_H3_QKV_WIRE_DTYPE` | `bf16` | Q/K/V transport dtype; opt in to `int8` |
+| `MINIMAX_H3_OUTPUT_WIRE_DTYPE` | `bf16` | Attention-output transport dtype; opt in to `fp8` |
 
 The script derives `NUM_GPUS = TP_SIZE × USP_SIZE`, checks the visible GPU list,
 and passes the matching vLLM startup flags. Use `MINIMAX_H3_GPU_LIST` to select
@@ -149,6 +151,31 @@ excluded from the default combined config until a matched TP2×USP4 run shows
 otherwise. Historical modulation and quantization tests passed on the source
 revision recorded in the experiment history; they have not been rerun here.
 
+## Ulysses communication quantization
+
+The opt-in combination transports Q/K/V as group-32 symmetric INT8 with
+per-group FP16 scales, then transports the attention output as E4M3 FP8. The
+attention math and tensors returned to the model remain BF16. The specialized
+path is limited to H3's active strict-Ulysses QKV fusion context, CUDA BF16
+activations, and head dimension 128; unsupported shapes fall back to BF16.
+
+Enable both wire formats explicitly:
+
+```bash
+MINIMAX_H3_QKV_WIRE_DTYPE=int8 \
+MINIMAX_H3_OUTPUT_WIRE_DTYPE=fp8 \
+./experiments/minimax_h3_5090_integration/run_server.sh
+```
+
+The 4-rank correctness smoke is preserved as
+[`comm_quant_smoke.py`](comm_quant_smoke.py). It compares each exchange with a
+native BF16 all-to-all. It was not rerun while reorganizing this branch. No
+matched end-to-end or pure-denoise result exists for this combined INT8-QKV /
+FP8-output mode on the ordered FP8 stack, so it remains opt-in. The older
+INT8-QKV-only experiment regressed denoising by 13.9% and changed output
+quality; that result is not evidence for the new paired wire format, but it is
+a reason not to claim a speedup without a fresh A/B.
+
 ### Validation record
 
 - `bash -n` and local dry runs passed for the default TP2×USP4/DLO50 configuration
@@ -163,6 +190,9 @@ revision recorded in the experiment history; they have not been rerun here.
   recorded source; they have not been rerun on this ordered stack.
 - AdaLN-QKV tile64 and FP8 adaptation tests passed on their recorded source;
   they have not been rerun on this ordered stack.
+- Communication-quantization CUDA smoke exists in the source snapshot; it was
+  not run during this reorganization. Its paired INT8/FP8 latency and quality
+  remain unmeasured on the ordered stack.
 - The selected CLI flags match prior H3 5090 server launches. Per the current
   instruction, this reorganization does not start a new GPU server; the new
   stack will not be described as end-to-end revalidated until such a run is

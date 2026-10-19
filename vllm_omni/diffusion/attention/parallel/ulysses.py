@@ -34,6 +34,30 @@ def _h3_qkv_fusion_enabled() -> bool:
     return os.environ.get("MINIMAX_H3_QKV_A2A_FUSION", "1").lower() not in {"0", "false", "off", "no"}
 
 
+def _h3_qkv_wire_dtype() -> str:
+    if not _h3_qkv_fusion_enabled():
+        return "bf16"
+    wire_dtype = os.environ.get("MINIMAX_H3_QKV_WIRE_DTYPE", "bf16").lower()
+    if wire_dtype not in {"bf16", "int8"}:
+        logger.warning_once(
+            "Unsupported MiniMax H3 QKV wire dtype %r; using BF16.", wire_dtype
+        )
+        return "bf16"
+    return wire_dtype
+
+
+def _h3_output_wire_dtype() -> str:
+    if not _h3_qkv_fusion_enabled():
+        return "bf16"
+    wire_dtype = os.environ.get("MINIMAX_H3_OUTPUT_WIRE_DTYPE", "bf16").lower()
+    if wire_dtype not in {"bf16", "fp8"}:
+        logger.warning_once(
+            "Unsupported MiniMax H3 attention-output wire dtype %r; using BF16.", wire_dtype
+        )
+        return "bf16"
+    return wire_dtype
+
+
 def _same_qkv_layout(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, world_size: int) -> bool:
     """Whether Q/K/V share a payload layout suitable for one packed exchange."""
     return (
@@ -249,6 +273,50 @@ class _UlyssesCtx(ParallelAttentionContext):
     uaa_local_seq_len: int = 0
     orig_head_cnt: int = 0
     joint_orig_head_cnt: int = 0
+
+
+def _try_h3_output_all_to_all_fp8(
+    ctx: _UlyssesCtx,
+    output: torch.Tensor,
+    *,
+    a2a_permute_enabled: bool,
+) -> torch.Tensor | None:
+    """Use FP8 only for the H3 image-output reverse exchange when supported."""
+    if _h3_output_wire_dtype() != "fp8":
+        return None
+    world_size = dist.get_world_size(ctx.ulysses_pg)
+    if world_size == 1 or a2a_permute_enabled or ctx.scatter_idx != 2 or ctx.gather_idx != 1:
+        return None
+    if not _h3_qkv_fusion_enabled():
+        return None
+
+    from vllm_omni.diffusion.attention.parallel.h3_comm_quant import (
+        can_transport_output_fp8,
+        output_all_to_all_fp8,
+    )
+
+    if not can_transport_output_fp8(output):
+        logger.warning_once(
+            "MiniMax H3 FP8 output transport requires CUDA BF16 attention output with head_dim=128; "
+            "falling back to BF16 Ulysses transport."
+        )
+        return None
+    seq_lens = (
+        list(ctx.uaa_seq_lens)
+        if ctx.use_uaa
+        else [int(output.shape[1]) // world_size] * world_size
+    )
+    local_seq_len = (
+        ctx.uaa_local_seq_len if ctx.use_uaa else int(output.shape[1]) // world_size
+    )
+    return output_all_to_all_fp8(
+        ctx.ulysses_pg,
+        output,
+        seq_lens=seq_lens,
+        local_seq_len=local_seq_len,
+        orig_head_cnt=ctx.orig_head_cnt if ctx.use_uaa else 0,
+        use_sync=ctx.use_sync,
+    )
 
 
 class UlyssesParallelAttention:
@@ -570,15 +638,47 @@ class UlyssesParallelAttention:
                 )
             )
             if can_fuse_qkv:
-                qkv = torch.stack((query, key, value), dim=2)
-                qkv = SeqAllToAll5D.apply(
-                    self._ulysses_pg,
-                    qkv,
-                    3,
-                    1,
-                    self._use_sync,
-                )
-                query, key, value = qkv.unbind(dim=2)
+                if _h3_qkv_wire_dtype() == "int8":
+                    from vllm_omni.diffusion.attention.parallel.h3_comm_quant import (
+                        can_transport_qkv_int8,
+                        qkv_all_to_all_int8,
+                    )
+
+                    if can_transport_qkv_int8(query, key, value):
+                        local_seq_len = int(query.shape[1])
+                        query, key, value = qkv_all_to_all_int8(
+                            self._ulysses_pg,
+                            query,
+                            key,
+                            value,
+                            seq_lens=[local_seq_len] * ulysses_world_size,
+                            padded_head_cnt=int(query.shape[2]),
+                            use_sync=self._use_sync,
+                        )
+                    else:
+                        logger.warning_once(
+                            "MiniMax H3 INT8 QKV transport requires CUDA BF16 Q/K/V with head_dim=128; "
+                            "falling back to BF16 Ulysses transport."
+                        )
+                        qkv = torch.stack((query, key, value), dim=2)
+                        qkv = SeqAllToAll5D.apply(
+                            self._ulysses_pg,
+                            qkv,
+                            3,
+                            1,
+                            self._use_sync,
+                        )
+                        query, key, value = qkv.unbind(dim=2)
+                else:
+                    qkv = torch.stack((query, key, value), dim=2)
+                    qkv = SeqAllToAll5D.apply(
+                        self._ulysses_pg,
+                        qkv,
+                        3,
+                        1,
+                        self._use_sync,
+                    )
+                    query, key, value = qkv.unbind(dim=2)
                 if gate_compress is not None:
                     gate_compress = SeqAllToAll4D.apply(
                         self._ulysses_pg, gate_compress, self._scatter_idx, self._gather_idx, self._use_sync
@@ -715,7 +815,20 @@ class UlyssesParallelAttention:
             # SeqAllToAll4D handles: Scatter gather_idx, Gather scatter_idx.
             # Forward: Scatter 2 (H), Gather 1 (S).
             # Reverse: Scatter 1 (S), Gather 2 (H).
-            if ctx.use_uaa:
+            ulysses_world_size = dist.get_world_size(ctx.ulysses_pg)
+            fp8_output_img = _try_h3_output_all_to_all_fp8(
+                ctx,
+                output_img,
+                a2a_permute_enabled=_a2a_permute_enabled(
+                    self._ulysses_a2a_permute,
+                    ctx.scatter_idx,
+                    ctx.gather_idx,
+                    ulysses_world_size,
+                ),
+            )
+            if fp8_output_img is not None:
+                output_img = fp8_output_img
+            elif ctx.use_uaa:
                 output_img = _ulysses_all_to_all_any_o(
                     ctx.ulysses_pg,
                     output_img,
@@ -760,6 +873,19 @@ class UlyssesParallelAttention:
                 return torch.cat([output_img, output_joint], dim=1)
 
         # Standard Ulysses Reverse
+        ulysses_world_size = dist.get_world_size(ctx.ulysses_pg)
+        fp8_output = _try_h3_output_all_to_all_fp8(
+            ctx,
+            attn_output,
+            a2a_permute_enabled=_a2a_permute_enabled(
+                self._ulysses_a2a_permute,
+                ctx.scatter_idx,
+                ctx.gather_idx,
+                ulysses_world_size,
+            ),
+        )
+        if fp8_output is not None:
+            return fp8_output
         if ctx.use_uaa:
             return _ulysses_all_to_all_any_o(
                 ctx.ulysses_pg,
