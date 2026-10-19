@@ -1088,13 +1088,23 @@ class MiniMaxH3Pipeline(
                 )
             self.text_encoder_tp_size = text_encoder_tp_size
             self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
-            self.text_encoder = MiniMaxH3Qwen3VLEncoder(
-                os.path.join(model_path, "text_encoder"),
-                device=self.device,
-                load_model=rank < text_encoder_tp_size,
-                encoder_group=self.text_encoder_group,
-                quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
-            )
+            encoder_kwargs = {
+                "device": self.device,
+                "load_model": rank < text_encoder_tp_size,
+                "encoder_group": self.text_encoder_group,
+                "quant_config": _resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
+            }
+            if os.environ.get("MINIMAX_H3_TEXT_ENCODER_INIT_ON_CPU") == "1":
+                # Keep the full resident DiT from overlapping the text
+                # encoder's construction-time allocation peak.
+                with torch.device("cpu"):
+                    self.text_encoder = MiniMaxH3Qwen3VLEncoder(
+                        os.path.join(model_path, "text_encoder"), **encoder_kwargs
+                    )
+            else:
+                self.text_encoder = MiniMaxH3Qwen3VLEncoder(
+                    os.path.join(model_path, "text_encoder"), **encoder_kwargs
+                )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
                     DiffusersPipelineLoader.ComponentSource(

@@ -1556,6 +1556,18 @@ class MiniMaxH3DiTModel(nn.Module):
                 # parameter, including TP slicing and online quantization.
                 weight_loader(param, loaded_weight, layout)
                 qkv_parts.setdefault(name, set()).add(layout)
+            elif name.endswith(".attn.qkv_proj.weight_scale"):
+                # The native checkpoint stores grouped [q, k, v] rows inside
+                # each query group, while QKVParallelLinear expects all Q rows,
+                # then K, then V. Per-output-channel ModelOpt scales follow the
+                # same row permutation as their FP8 weights.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                )
+                weight_loader(param, loaded_weight)
             elif name.endswith(".attn.qkv_proj.weight"):
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost.
@@ -1566,6 +1578,18 @@ class MiniMaxH3DiTModel(nn.Module):
                     head_dim=self.arch.attention_head_dim,
                 )
                 weight_loader(param, loaded_weight)
+            elif name.endswith(".mlp.fc1.weight_scale"):
+                # MergedColumnParallelLinear stores gate and up scales in
+                # separate shards. The checkpoint concatenates those channels
+                # in the same row order as fc1.weight.
+                if loaded_weight.shape[0] % 2:
+                    raise ValueError(
+                        "MiniMax H3 fc1 weight_scale rows must split evenly into "
+                        f"gate/up vectors, got {tuple(loaded_weight.shape)}"
+                    )
+                first, second = loaded_weight.chunk(2, dim=0)
+                weight_loader(param, first, 0)
+                weight_loader(param, second, 1)
             elif name.endswith(".mlp.fc1.weight"):
                 if loaded_weight.shape[0] % 2:
                     raise ValueError(
