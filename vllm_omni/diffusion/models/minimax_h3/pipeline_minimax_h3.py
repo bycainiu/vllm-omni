@@ -630,6 +630,90 @@ class _SingleRankEncoderGroup:
         self.device_group = None
 
 
+def _build_adaln_schedule_contract(
+    cache: Any,
+    *,
+    task: str,
+    num_steps: int,
+    base_schedule: Sequence[float] | None,
+    video_shift: float,
+    audio_shift: float,
+    visual_shapes: Sequence[tuple[int, int, int]] | None,
+    audio_lengths: Sequence[int] | None,
+) -> dict[str, Any] | None:
+    """Build the schedule contract wherever the denoise pass consumes it."""
+    if cache is None or (cache.sidecar is None and not cache.prune_weights_requested):
+        return None
+    mode = task
+    if task == "ref2va":
+        mode += "-mixed" if visual_shapes and audio_lengths else "-audio" if audio_lengths else "-image"
+    return dict(
+        mode=mode,
+        num_steps=num_steps,
+        base_schedule=base_schedule,
+        flow_shift=float(video_shift),
+        audio_flow_shift=float(audio_shift),
+    )
+
+
+def _prepare_and_prune_adaln_weights(
+    transformer: Any,
+    contract: Mapping[str, Any],
+    *,
+    residency_controller: Any | None = None,
+) -> int:
+    """Build the exact sidecar before loading full DLO resident layers.
+
+    Schedule construction reads only the block AdaLN projections plus the
+    already resident time embedder/final projection.  Stage the block
+    projections selectively, then permanently remove them from DLO backing
+    after the sidecar is verified.  The normal full-layer load happens later,
+    immediately before denoising.
+    """
+    cache = transformer.adaln_cache
+    block_parameters = tuple(
+        parameter
+        for block in transformer.blocks
+        if block.adaln_proj.linear is not None
+        for parameter in block.adaln_proj.linear.parameters()
+    )
+    if cache.sidecar is None:
+        if residency_controller is not None:
+            logger.info("AdaLN precompute will stage each DLO block projection on demand")
+        try:
+            if residency_controller is None:
+                transformer.prepare_adaln_pruning(contract)
+            else:
+                transformer.prepare_adaln_pruning(contract, parameter_stager=residency_controller)
+        except Exception:
+            if residency_controller is not None:
+                residency_controller.offload_resident_parameters(block_parameters)
+            raise
+    else:
+        cache.sidecar.check_request(**contract)
+
+    resident_parameters = tuple(
+        parameter
+        for projection in (
+            *(block.adaln_proj for block in transformer.blocks),
+            transformer.final_layer.adaln_proj,
+        )
+        if projection.linear is not None
+        for parameter in projection.linear.parameters()
+    )
+    try:
+        removed_parameters = transformer.prune_adaln_weights()
+    except Exception:
+        if residency_controller is not None:
+            residency_controller.offload_resident_parameters(block_parameters)
+        raise
+    if residency_controller is not None:
+        released_parameters = residency_controller.release_pruned_resident_parameters(resident_parameters)
+        logger.info("Removed %d pruned AdaLN parameters from the DLO resident backing", released_parameters)
+    logger.info("AdaLN pruning removed %d parameters on this rank", removed_parameters)
+    return removed_parameters
+
+
 class MiniMaxH3Pipeline(
     nn.Module,
     DenoiseProgressMixin,
@@ -1053,7 +1137,6 @@ class MiniMaxH3Pipeline(
                 None,
                 eligible=transformer_quant_config is None and not modular,
             )
-
         if self.load_text_encoder:
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
                 str(model_path),
@@ -1322,7 +1405,18 @@ class MiniMaxH3Pipeline(
     def _prepare_adaln_adapter(self, sampling: OmniDiffusionSamplingParams) -> None:
         request = getattr(sampling, "lora_request", None)
         identity = None if request is None else (request.lora_int_id, request.lora_path, float(sampling.lora_scale))
+        prune_requested = any(
+            getattr(getattr(self, name, None), "adaln_cache", None) is not None
+            and getattr(self, name).adaln_cache.prune_weights_requested
+            for name in ("transformer", "transformers_ref")
+        )
+        if prune_requested and identity is not None:
+            raise ValueError("AdaLN weight pruning does not support request-time LoRA adapters")
         if identity != getattr(self, "_adaln_adapter_identity", None):
+            for name in ("transformer", "transformers_ref"):
+                cache = getattr(getattr(self, name, None), "adaln_cache", None)
+                if cache is not None and cache.weights_pruned:
+                    raise ValueError("AdaLN weight pruning locks this model instance to its verified adapter")
             self._clear_adaln_caches()
             self._adaln_adapter_identity = identity
 
@@ -1782,13 +1876,24 @@ class MiniMaxH3Pipeline(
     @contextmanager
     def _resident_dit_layers_on_device(self, *, enabled: bool = True):
         controller = getattr(self, "_dlo_residency_controller", None)
+        diagnose_adaln = False
         if controller is not None and enabled:
+            cache = getattr(getattr(self, "transformer", None), "adaln_cache", None)
+            diagnose_adaln = cache is not None and cache.prune_weights_requested
+            if diagnose_adaln:
+                logger.info("AdaLN pruning diagnostic: DLO resident load starting")
             controller.load_resident_layers()
+            if diagnose_adaln:
+                logger.info("AdaLN pruning diagnostic: DLO resident load complete")
         try:
             yield
         finally:
             if controller is not None and enabled:
+                if diagnose_adaln:
+                    logger.info("AdaLN pruning diagnostic: DLO resident offload starting")
                 controller.offload_resident_layers()
+                if diagnose_adaln:
+                    logger.info("AdaLN pruning diagnostic: DLO resident offload complete")
 
     def _build_denoise_inputs(
         self,
@@ -2118,6 +2223,7 @@ class MiniMaxH3Pipeline(
         refine: MiniMaxH3LatentRefineSpec | None = None,
         request_context: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        logger.info("MiniMax H3 diffuse entry: task=%s steps=%d", task, num_steps)
         # Consume request-owned noise here so caller keyword dictionaries cannot
         # keep the host buffers alive throughout denoising.
         inputs = self._build_denoise_inputs(
@@ -2163,8 +2269,20 @@ class MiniMaxH3Pipeline(
                 None if request_context is None else request_context.pop("precomputed_visual_condition_noise", None)
             ),
         )
+        logger.info("MiniMax H3 diffuse inputs ready: task=%s steps=%d", task, num_steps)
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
+        cache = getattr(transformer, "adaln_cache", None)
+        adaln_contract = _build_adaln_schedule_contract(
+            cache,
+            task=task,
+            num_steps=num_steps,
+            base_schedule=base_schedule,
+            video_shift=video_shift,
+            audio_shift=audio_shift,
+            visual_shapes=visual_condition_shapes,
+            audio_lengths=audio_condition_lengths,
+        )
         # Each pass (including each output and hi-res refine) owns its cache.
         # Refine can change both the packed shape and the schedule length.
         registry = getattr(transformer, "_hook_registry", None)
@@ -2173,6 +2291,17 @@ class MiniMaxH3Pipeline(
         cache_runtime = getattr(self, "_cache_dit_runtime", None)
         if cache_runtime is not None:
             cache_runtime.refresh(len(inputs["sigmas_video"]) - 1)
+        if cache is not None and cache.should_prune(num_steps) and not cache.weights_pruned:
+            if adaln_contract is None:
+                raise RuntimeError("AdaLN pruning request is missing its resolved schedule")
+            controller = getattr(self, "_dlo_residency_controller", None)
+            if transformer is not self.transformer:
+                controller = None
+            _prepare_and_prune_adaln_weights(
+                transformer,
+                adaln_contract,
+                residency_controller=controller,
+            )
         with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
@@ -3034,19 +3163,31 @@ class MiniMaxH3Pipeline(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
         cache = getattr(transformer, "adaln_cache", None)
-        if cache is not None and cache.sidecar is not None:
-            mode = task
-            if task == "ref2va":
-                mode += "-mixed" if visual_shapes and audio_lengths else "-audio" if audio_lengths else "-image"
+        adaln_contract = _build_adaln_schedule_contract(
+            cache,
+            task=task,
+            num_steps=num_steps,
+            base_schedule=base_schedule,
+            video_shift=float(extra.get("flow_shift", self.default_video_shift)),
+            audio_shift=float(extra.get("audio_flow_shift", self.default_audio_shift)),
+            visual_shapes=visual_shapes,
+            audio_lengths=audio_lengths,
+        )
+        if (
+            cache is not None
+            and cache.sidecar is not None
+            and (not cache.prune_weights_requested or cache.weights_pruned or cache.should_prune(num_steps))
+        ):
+            assert adaln_contract is not None
             try:
-                cache.sidecar.check_request(
-                    mode=mode,
-                    num_steps=num_steps,
-                    base_schedule=base_schedule,
-                    flow_shift=float(extra.get("flow_shift", self.default_video_shift)),
-                    audio_flow_shift=float(extra.get("audio_flow_shift", self.default_audio_shift)),
-                )
+                cache.sidecar.check_request(**adaln_contract)
             except ValueError as exc:
+                if cache.weights_pruned:
+                    raise ValueError(
+                        "This model instance has pruned AdaLN weights and cannot change its verified schedule"
+                    ) from exc
+                if cache.prune_weights_requested:
+                    raise ValueError("AdaLN weight pruning sidecar does not cover this task or schedule") from exc
                 logger.warning("Rejecting optional AdaLN sidecar for this schedule; using runtime cache: %s", exc)
                 cache.clear()
         quality_plan = self._quality_policy.resolve(

@@ -1,0 +1,6 @@
+{
+  "minimax_h3_staged_dma": true,
+  "minimax_h3_adaln_cache": true,
+  "minimax_h3_adaln_prune_weights": true,
+  "minimax_h3_adaln_prune_min_steps": 50
+}

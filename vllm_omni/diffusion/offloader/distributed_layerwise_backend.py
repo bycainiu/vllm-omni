@@ -18,6 +18,9 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+import ctypes
+import mmap
+import sys
 import threading
 import time
 import weakref
@@ -35,7 +38,7 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
 )
-from vllm_omni.host_weight_runtime import HostWeightLease
+from vllm_omni.host_weight_runtime import HostWeightLease, MappedHostRegion
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, run_cleanup_steps
@@ -79,6 +82,37 @@ logger = init_logger(__name__)
 def _cpu_shards_need_staging(cpu_shards: dict[torch.dtype, torch.Tensor]) -> bool:
     """Return whether any CPU shard needs copying into pinned host memory."""
     return any(tensor.numel() and not tensor.is_pinned() for tensor in cpu_shards.values())
+
+
+def _discard_file_backed_tensor_pages(tensor: torch.Tensor) -> int:
+    """Ask Linux to drop clean pages for an immutable mmap-backed tensor."""
+    if sys.platform != "linux" or tensor.device.type != "cpu" or not tensor.numel():
+        return 0
+    try:
+        if tensor.is_pinned():
+            return 0
+    except RuntimeError:
+        return 0
+
+    page_size = mmap.PAGESIZE
+    itemsize = tensor.element_size()
+    low = sum(min(0, (size - 1) * stride) for size, stride in zip(tensor.shape, tensor.stride()))
+    high = sum(max(0, (size - 1) * stride) for size, stride in zip(tensor.shape, tensor.stride()))
+    start = tensor.data_ptr() + low * itemsize
+    end = tensor.data_ptr() + (high + 1) * itemsize
+    page_start = start - start % page_size
+    page_end = ((end + page_size - 1) // page_size) * page_size
+    if page_end <= page_start:
+        return 0
+
+    try:
+        madvise = ctypes.CDLL(None, use_errno=True).madvise
+        madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+        madvise.restype = ctypes.c_int
+        result = madvise(ctypes.c_void_p(page_start), ctypes.c_size_t(page_end - page_start), mmap.MADV_DONTNEED)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return 0
+    return page_end - page_start if result == 0 else 0
 
 # A backend normally owns both objects below. This process-lifetime safety
 # owner prevents HostWeightLease.__del__ from unmapping storage when cleanup
@@ -933,6 +967,8 @@ class PinnedResidentLayerGroup:
 
         self._cpu_staging_buffers: list[dict[torch.dtype, torch.Tensor]] = []
         self._cpu_staging_events: list[Any | None] = [None, None]
+        self._partial_gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
+        self._partial_staged_parameter_ids: set[int] = set()
         needs_staging = rank_local_mmap or (
             staged_dma
             and any(_cpu_shards_need_staging(state["cpu_shards"]) for state in self._states)
@@ -963,6 +999,8 @@ class PinnedResidentLayerGroup:
     def load(self) -> None:
         if self.loaded:
             return
+        if self._partial_staged_parameter_ids:
+            raise RuntimeError("cannot load all resident layers while parameters are selectively staged")
 
         # Allocate on the compute stream so the caching allocator can reuse
         # blocks released by the encoder stage.  Allocating on the copy stream
@@ -1037,20 +1075,32 @@ class PinnedResidentLayerGroup:
                         staged_weights = cpu_weights
                     else:
                         with torch.profiler.record_function(f"PinnedDMA/stage_to_pinned/slot{slot}"):
-                            for dtype, cpu_weight in cpu_weights.items():
-                                if cpu_weight.is_pinned():
-                                    staged_weights[dtype] = cpu_weight
-                                else:
-                                    staged = slot_buffers[dtype][: cpu_weight.numel()]
-                                    staged.copy_(cpu_weight)
-                                    staged_weights[dtype] = staged
+                            for dtype, metas in state["metadata"].items():
+                                cpu_weight = cpu_weights[dtype]
+                                required = max(
+                                    (meta["offset"] + meta["numel"] for meta in metas),
+                                    default=0,
+                                )
+                                staged = slot_buffers[dtype][:required]
+                                for meta in metas:
+                                    source_offset = meta.get("cpu_offset", meta["offset"])
+                                    target_offset = meta["offset"]
+                                    count = meta["numel"]
+                                    staged[target_offset : target_offset + count].copy_(
+                                        cpu_weight[source_offset : source_offset + count]
+                                    )
+                                staged_weights[dtype] = staged
 
                     with torch.profiler.record_function(f"PinnedDMA/h2d/slot{slot}"):
-                        for dtype, staged_weight in staged_weights.items():
-                            block_buffers[dtype].copy_(
-                                staged_weight,
-                                non_blocking=staged_weight.is_pinned(),
-                            )
+                        for dtype, metas in state["metadata"].items():
+                            staged_weight = staged_weights[dtype]
+                            for meta in metas:
+                                offset = meta["offset"]
+                                count = meta["numel"]
+                                block_buffers[dtype][offset : offset + count].copy_(
+                                    staged_weight[offset : offset + count],
+                                    non_blocking=staged_weight.is_pinned(),
+                                )
                     slot_ready = current_omni_platform.Event()
                     slot_ready.record(self.copy_stream)
                     self._cpu_staging_events[slot] = slot_ready
@@ -1059,18 +1109,41 @@ class PinnedResidentLayerGroup:
                 if self.staged_dma:
                     slot = index % 2
                     with torch.profiler.record_function(f"PinnedDMA/h2d_direct/slot{slot}"):
-                        for dtype, cpu_weight in cpu_weights.items():
-                            block_buffers[dtype].copy_(
-                                cpu_weight,
-                                non_blocking=cpu_weight.is_pinned(),
-                            )
+                        for dtype, metas in state["metadata"].items():
+                            cpu_weight = cpu_weights[dtype]
+                            for meta in metas:
+                                source_offset = (
+                                    meta["offset"]
+                                    if self.rank_local_mmap
+                                    else meta.get("cpu_offset", meta["offset"])
+                                )
+                                target_offset = meta["offset"]
+                                count = meta["numel"]
+                                source = cpu_weight[source_offset : source_offset + count]
+                                block_buffers[dtype][target_offset : target_offset + count].copy_(
+                                    source,
+                                    non_blocking=source.is_pinned(),
+                                )
                     continue
 
-                for dtype, cpu_weight in cpu_weights.items():
-                    block_buffers[dtype].copy_(
-                        cpu_weight,
-                        non_blocking=cpu_weight.is_pinned(),
-                    )
+                if self.rank_local_mmap:
+                    for dtype, cpu_weight in cpu_weights.items():
+                        block_buffers[dtype].copy_(
+                            cpu_weight,
+                            non_blocking=cpu_weight.is_pinned(),
+                        )
+                else:
+                    # After pruning, logical GPU offsets are compact while the
+                    # pinned CPU master intentionally keeps its original
+                    # backing allocation. Copy only retained ranges so setup
+                    # never duplicates every resident CPU shard at once.
+                    for dtype, metas in state["metadata"].items():
+                        cpu_weight = cpu_weights[dtype]
+                        for meta in metas:
+                            source_offset = meta.get("cpu_offset", meta["offset"])
+                            source = cpu_weight[source_offset : source_offset + meta["numel"]]
+                            destination = block_buffers[dtype][meta["offset"] : meta["offset"] + meta["numel"]]
+                            destination.copy_(source, non_blocking=cpu_weight.is_pinned())
                 if self.rank_local_mmap:
                     slot_ready = current_omni_platform.Event()
                     slot_ready.record(self.copy_stream)
@@ -1109,6 +1182,254 @@ class PinnedResidentLayerGroup:
         self._gpu_buffers.clear()
         self.loaded = False
 
+    def stage_parameters(self, parameter_ids: set[int]) -> int:
+        """Stage only selected resident weights without loading full DLO layers.
+
+        AdaLN schedule construction needs each block's projection weights, but
+        the remaining block weights are not used until denoising.  Copying the
+        selected metadata slices directly from the retained CPU shard or mmap
+        source avoids touching and transferring every resident block first.
+        """
+        if not parameter_ids:
+            return 0
+        if self.loaded:
+            return 0
+        already_staged = self._partial_staged_parameter_ids & parameter_ids
+        if already_staged:
+            raise RuntimeError("some requested resident parameters are already selectively staged")
+
+        selections: list[tuple[int, torch.dtype, dict[str, Any], torch.Tensor]] = []
+        found_ids: set[int] = set()
+        for state_index, state in enumerate(self._states):
+            targets = state["targets"]
+            for dtype, metas in state["metadata"].items():
+                mmap_sources = (
+                    {source["name"]: source for source in state["cpu_sources"][dtype]}
+                    if self.rank_local_mmap
+                    else None
+                )
+                for meta in metas:
+                    target = targets[meta["name"]]
+                    if id(target) not in parameter_ids:
+                        continue
+                    found_ids.add(id(target))
+                    if self.rank_local_mmap:
+                        source = DistributedLayerwiseOffloadHook._resolve_mmap_source(
+                            mmap_sources[meta["name"]], meta, dtype
+                        )
+                    else:
+                        flat = state["cpu_shards"][dtype]
+                        source_offset = meta.get("cpu_offset", meta["offset"])
+                        source = torch.as_strided(
+                            flat[source_offset : source_offset + meta["numel"]],
+                            size=meta["shape"],
+                            stride=meta["stride"],
+                        )
+                    selections.append((state_index, dtype, meta, source))
+
+        missing = parameter_ids - found_ids
+        if missing:
+            raise ValueError(f"{len(missing)} requested parameter(s) are not owned by the resident DLO group")
+        if not selections:
+            return 0
+
+        totals: dict[tuple[int, torch.dtype], int] = {}
+        for state_index, dtype, meta, _source in selections:
+            key = (state_index, dtype)
+            totals[key] = totals.get(key, 0) + meta["numel"]
+        staged_buffers = [
+            {
+                dtype: torch.empty(total, dtype=dtype, device=self.device)
+                for (buffer_state_index, dtype), total in totals.items()
+                if buffer_state_index == state_index
+            }
+            for state_index in range(len(self._states))
+        ]
+        offsets: dict[tuple[int, torch.dtype], int] = {}
+
+        self.copy_stream.wait_stream(current_omni_platform.current_stream())
+        ready = current_omni_platform.Event()
+        assignments: list[tuple[torch.Tensor, torch.Tensor, dict[str, Any]]] = []
+        published: list[torch.Tensor] = []
+        try:
+            with current_omni_platform.stream(self.copy_stream):
+                for state_index, dtype, meta, source in selections:
+                    key = (state_index, dtype)
+                    start = offsets.get(key, 0)
+                    end = start + meta["numel"]
+                    destination = staged_buffers[state_index][dtype][start:end]
+                    destination_view = torch.as_strided(
+                        destination,
+                        size=meta["shape"],
+                        stride=meta["stride"],
+                    )
+                    destination_view.copy_(source, non_blocking=source.is_pinned())
+                    target = self._states[state_index]["targets"][meta["name"]]
+                    assignments.append((target, destination, meta))
+                    offsets[key] = end
+                ready.record(self.copy_stream)
+
+            current_omni_platform.current_stream().wait_event(ready)
+            # Publish the staged storages only after every copy has succeeded.
+            for target, destination, meta in assignments:
+                set_tensor_storage(
+                    target,
+                    torch.as_strided(destination, size=meta["shape"], stride=meta["stride"]),
+                )
+                published.append(target)
+        except Exception:
+            current_omni_platform.synchronize()
+            for target in published:
+                set_tensor_storage(target, make_offload_placeholder(target))
+            raise
+
+        self._partial_gpu_buffers = staged_buffers
+        self._partial_staged_parameter_ids.update(found_ids)
+        return sum(meta["numel"] * source.element_size() for _, _, meta, source in selections)
+
+    def offload_parameters(self, parameter_ids: set[int]) -> None:
+        """Return selectively staged parameters to DLO placeholders."""
+        partial_ids = getattr(self, "_partial_staged_parameter_ids", set())
+        staged_ids = partial_ids & parameter_ids
+        if not staged_ids:
+            return
+        current_omni_platform.synchronize()
+        for state in self._states:
+            for name, target in state["targets"].items():
+                if id(target) in staged_ids:
+                    set_tensor_storage(target, make_offload_placeholder(target))
+        partial_ids.difference_update(staged_ids)
+        if not partial_ids:
+            getattr(self, "_partial_gpu_buffers", []).clear()
+
+    def release_source_pages(self, parameter_ids: set[int]) -> int:
+        """Release clean mmap pages after their selected tensors are consumed."""
+        if not self.rank_local_mmap or not parameter_ids:
+            return 0
+        released_bytes = 0
+        for state in self._states:
+            targets = state["targets"]
+            selected_names = {name for name, target in targets.items() if id(target) in parameter_ids}
+            if not selected_names:
+                continue
+            for sources in state["cpu_sources"].values():
+                for source in sources:
+                    if source["name"] in selected_names:
+                        released_bytes += _discard_file_backed_tensor_pages(source["tensor"])
+        return released_bytes
+
+    def exclude_parameters(self, parameter_ids: set[int]) -> int:
+        """Drop permanently removed parameters from resident host/device storage.
+
+        AdaLN pruning can happen after this group has captured resident blocks.
+        Repacking device and host buffers here prevents another full H2D pass
+        and keeps the removed parameters from returning on the next stage.
+        """
+        if not parameter_ids:
+            return 0
+        if not any(id(target) in parameter_ids for state in self._states for target in state["targets"].values()):
+            return 0
+        was_loaded = self.loaded
+        if was_loaded:
+            # Finish the initial DLO load and AdaLN precompute before replacing
+            # parameter storage or reusing the copy buffers.
+            current_omni_platform.synchronize()
+        else:
+            self.offload_parameters(parameter_ids)
+
+        removed_numel = 0
+        for state_index, state in enumerate(self._states):
+            targets = state["targets"]
+            removed_names = {name for name, target in targets.items() if id(target) in parameter_ids}
+            if not removed_names:
+                continue
+            gpu_buffers = self._gpu_buffers[state_index] if was_loaded else None
+            handled_removed_names: set[str] = set()
+
+            for dtype, metadata in tuple(state["metadata"].items()):
+                kept = [meta for meta in metadata if meta["name"] not in removed_names]
+                removed = [meta for meta in metadata if meta["name"] in removed_names]
+                for meta in removed:
+                    target = targets[meta["name"]]
+                    handled_removed_names.add(meta["name"])
+                    removed_numel += meta["numel"]
+                    set_tensor_storage(target, make_offload_placeholder(target))
+
+                offset = 0
+                compacted = []
+                for meta in kept:
+                    compacted.append(
+                        meta
+                        | {
+                            "cpu_offset": meta.get("cpu_offset", meta["offset"]),
+                            "offset": offset,
+                        }
+                    )
+                    offset += meta["numel"]
+
+                if was_loaded:
+                    assert gpu_buffers is not None
+                    previous_device_buffer = gpu_buffers[dtype]
+                    if kept:
+                        compacted_device_buffer = torch.empty(offset, dtype=dtype, device=self.device)
+                        for old_meta, new_meta in zip(kept, compacted, strict=True):
+                            size = old_meta["numel"]
+                            source = previous_device_buffer[old_meta["offset"] : old_meta["offset"] + size]
+                            destination = compacted_device_buffer[new_meta["offset"] : new_meta["offset"] + size]
+                            destination.copy_(source)
+                            set_tensor_storage(
+                                targets[new_meta["name"]],
+                                torch.as_strided(
+                                    destination,
+                                    size=new_meta["shape"],
+                                    stride=new_meta["stride"],
+                                ),
+                            )
+                        gpu_buffers[dtype] = compacted_device_buffer
+                    else:
+                        gpu_buffers.pop(dtype)
+
+                if not kept:
+                    state["metadata"].pop(dtype)
+                    state["cpu_shards"].pop(dtype, None)
+                    state["cpu_sources"].pop(dtype, None)
+                    continue
+
+                if self.rank_local_mmap:
+                    sources = state["cpu_sources"][dtype]
+                    source_by_name = {source["name"]: source for source in sources}
+                    state["cpu_sources"][dtype] = [source_by_name[meta["name"]] for meta in compacted]
+                # For ordinary CPU shards, leave the pinned master allocation
+                # in place and retain each surviving tensor's original source
+                # offset in cpu_offset. Compacting here used to allocate a
+                # second pinned copy of every retained layer before releasing
+                # the first one, which could exceed the host-memory guard.
+                state["metadata"][dtype] = compacted
+
+            for name in removed_names:
+                target = targets.pop(name)
+                if name not in handled_removed_names:
+                    removed_numel += target.numel()
+            if was_loaded:
+                assert gpu_buffers is not None
+                self._gpu_buffers[state_index] = gpu_buffers
+
+        if self.rank_local_mmap:
+            max_sizes: dict[torch.dtype, int] = {}
+            for state in self._states:
+                for dtype, metadata in state["metadata"].items():
+                    max_sizes[dtype] = max(max_sizes.get(dtype, 0), sum(meta["numel"] for meta in metadata))
+            self._cpu_staging_buffers = [
+                {
+                    dtype: torch.empty(total, dtype=dtype, device="cpu", pin_memory=self.pin_memory)
+                    for dtype, total in max_sizes.items()
+                }
+                for _ in range(2)
+            ]
+            self._cpu_staging_events = [None, None]
+
+        return removed_numel
+
     def restore_to_cpu(self) -> None:
         """Materialize the persistent host masters back into the module.
 
@@ -1117,6 +1438,9 @@ class PinnedResidentLayerGroup:
         the group, so it must first restore ordinary CPU tensors to make a
         later enable cycle safe.
         """
+        partial_ids = getattr(self, "_partial_staged_parameter_ids", set())
+        if partial_ids:
+            self.offload_parameters(set(partial_ids))
         self.offload()
 
         for state in self._states:
@@ -1130,8 +1454,9 @@ class PinnedResidentLayerGroup:
 
                 flat = state["cpu_shards"][dtype]
                 for meta in metas:
+                    source_offset = meta.get("cpu_offset", meta["offset"])
                     source = torch.as_strided(
-                        flat[meta["offset"] : meta["offset"] + meta["numel"]],
+                        flat[source_offset : source_offset + meta["numel"]],
                         size=meta["shape"],
                         stride=meta["stride"],
                     )
@@ -1195,10 +1520,33 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if self._resident_layer_group is not None:
             self._resident_layer_group.load()
 
+    def stage_resident_parameters(self, parameters: Sequence[torch.Tensor]) -> int:
+        """Stage selected resident weights while leaving other DLO layers on host."""
+        if self._resident_layer_group is None:
+            return 0
+        return self._resident_layer_group.stage_parameters({id(parameter) for parameter in parameters})
+
+    def offload_resident_parameters(self, parameters: Sequence[torch.Tensor]) -> None:
+        """Discard temporary selected-weight staging after a failed precompute."""
+        if self._resident_layer_group is not None:
+            self._resident_layer_group.offload_parameters({id(parameter) for parameter in parameters})
+
+    def release_resident_source_pages(self, parameters: Sequence[torch.Tensor]) -> int:
+        """Drop clean HWR or checkpoint mmap pages after block precompute."""
+        if self._resident_layer_group is None:
+            return 0
+        return self._resident_layer_group.release_source_pages({id(parameter) for parameter in parameters})
+
     def offload_resident_layers(self) -> None:
         """Release leading blocks before VAE decode to bound peak HBM."""
         if self._resident_layer_group is not None:
             self._resident_layer_group.offload()
+
+    def release_pruned_resident_parameters(self, parameters: Sequence[torch.Tensor]) -> int:
+        """Remove pruned model parameters from the resident layer backing."""
+        if self._resident_layer_group is None:
+            return 0
+        return self._resident_layer_group.exclude_parameters({id(parameter) for parameter in parameters})
 
     def _clear_residency_controller(self) -> None:
         pipeline_ref = self._residency_pipeline_ref
@@ -1210,6 +1558,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
     def _rank_local_source_tensors(
         self,
         hooks: list[DistributedLayerwiseOffloadHook],
+        *,
+        exclude_adaln_projections: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Return the exact CPU sources that direct H2D would consume."""
         tensors: list[torch.Tensor] = []
@@ -1218,6 +1568,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         def collect(cpu_sources: dict[torch.dtype, list[dict[str, Any]]]) -> None:
             for sources in cpu_sources.values():
                 for source in sources:
+                    if exclude_adaln_projections and "adaln_proj.linear." in source["name"]:
+                        continue
                     tensor = source["tensor"]
                     if id(tensor) not in seen:
                         seen.add(id(tensor))
@@ -1229,6 +1581,38 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             for state in self._resident_layer_group._states:
                 collect(state["cpu_sources"])
         return tuple(tensors)
+
+    @staticmethod
+    def _mapped_regions_for_tensors(
+        mapped_regions: Sequence[MappedHostRegion],
+        tensors: Sequence[torch.Tensor],
+    ) -> tuple[MappedHostRegion, ...]:
+        """Describe only mapped file pages backing the requested source tensors."""
+        selected: list[MappedHostRegion] = []
+        for tensor in tensors:
+            if tensor.device.type != "cpu" or not tensor.numel():
+                continue
+            itemsize = tensor.element_size()
+            low = sum(min(0, (size - 1) * stride) for size, stride in zip(tensor.shape, tensor.stride()))
+            high = sum(max(0, (size - 1) * stride) for size, stride in zip(tensor.shape, tensor.stride()))
+            start = tensor.data_ptr() + low * itemsize
+            end = tensor.data_ptr() + (high + 1) * itemsize
+            owner = next(
+                (
+                    region
+                    for region in mapped_regions
+                    if region.address <= start and end <= region.address + region.length
+                ),
+                None,
+            )
+            if owner is None:
+                raise HostRegistrationError(
+                    "cannot associate an HWR source tensor with its immutable mapped-file region"
+                )
+            selected.append(MappedHostRegion(owner.file_name, start, end - start, read_only=owner.read_only))
+        if not selected:
+            raise HostRegistrationError("no non-empty source tensors were available for HWR registration")
+        return tuple(selected)
 
     def _try_register_hwr_mmap(self, source_tensors: tuple[torch.Tensor, ...]) -> bool:
         """Register the complete final-layout lease under pinned-memory policy."""
@@ -1247,7 +1631,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         started = time.perf_counter()
         try:
             registration = register_host_mappings(
-                lease.mapped_regions,
+                self._mapped_regions_for_tensors(lease.mapped_regions, source_tensors),
                 device=self.device,
                 max_bytes=max_bytes,
             )
@@ -1299,7 +1683,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         )
         return True
 
-    def _configure_hwr_transfer(self, hooks: list[DistributedLayerwiseOffloadHook]) -> None:
+    def _configure_hwr_transfer(
+        self,
+        hooks: list[DistributedLayerwiseOffloadHook],
+        pipeline: nn.Module,
+    ) -> None:
         """Select registered direct H2D or bounded staging once per backend."""
         plan = self.host_weight_plan
         if (
@@ -1325,7 +1713,21 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             )
             return
 
-        source_tensors = self._rank_local_source_tensors(hooks)
+        models = (getattr(pipeline, "transformer", None), getattr(pipeline, "transformers_ref", None))
+        prune_adaln = any(
+            model is not None
+            and getattr(getattr(model, "adaln_cache", None), "prune_weights_requested", False)
+            for model in models
+        )
+        if prune_adaln:
+            logger.warning(
+                "AdaLN pruning keeps block projection source pages pageable during schedule precompute; "
+                "direct HWR registration is limited to retained DLO tensor ranges"
+            )
+        source_tensors = self._rank_local_source_tensors(
+            hooks,
+            exclude_adaln_projections=prune_adaln,
+        )
         self._using_registered_mmap = self._try_register_hwr_mmap(source_tensors)
         for hook in hooks:
             hook.registered_mmap = self._using_registered_mmap
@@ -1920,7 +2322,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self._residency_pipeline_ref = weakref.ref(pipeline)
 
         all_hooks = [hook for group in self._all_hook_groups for hook in group]
-        self._configure_hwr_transfer(all_hooks)
+        self._configure_hwr_transfer(all_hooks, pipeline)
 
         if not self._all_hook_groups:
             self.enabled = bool(self._resident_blocks or self._encoder_modules or self._staged_components)

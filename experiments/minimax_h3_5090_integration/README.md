@@ -86,6 +86,25 @@ H2D. Pinned DMA is therefore a transfer-path correctness/startup optimization,
 not a measured pure-denoise gain. Historical focused DLO and model-loader tests
 passed; they have not been rerun on this ordered stack.
 
+## AdaLN schedule cache and pruning
+
+Use the combined [DLO + pinned DMA + AdaLN config](configs/dlo-pinned-dma-adaln-prune.json)
+for this stack point. It keeps AdaLN cache/pruning enabled, validates that all
+cached AdaLN projections remain unquantized under the FP8 model config, and
+uses the TP-aware schedule precompute that gathers each schedule's projected
+rows once. The pruning path requires 50-step schedules and all DLO-managed DiT
+layers resident; shorter schedules retain the projection weights.
+
+Historical measurements are configuration dependent. On the BF16 baseline,
+AdaLN cache/pruning alone preserved output hashes and saved about 4.7 GiB per
+card during denoising, but regressed E2E by 11.7% and denoising by 14.8%. In a
+later matched FP8/BF16 pair with the same AdaLN config, FP8 was 14.3% faster
+E2E and 16.2% faster in denoising than BF16. A separate FP8-only control was
+slower than its BF16 control; the FP8-plus-AdaLN result cannot be attributed to
+FP8 alone. Historical tests cover exact cached outputs, the TP gather path,
+FP8 scale compatibility, and DLO pruning; none has been rerun against the new
+commit chain or at TP2×USP4.
+
 ### Validation record
 
 - `bash -n` and local dry runs passed for the default TP2×USP4/DLO50 configuration
@@ -94,6 +113,8 @@ passed; they have not been rerun on this ordered stack.
   validated on the recorded experiment source; this branch has not rerun them.
 - Pinned DMA's DLO and model-loader test suites passed on its recorded source;
   this branch has not rerun them.
+- AdaLN cache/pruning and TP schedule-precompute tests passed on their recorded
+  source; this branch has not rerun them.
 - The selected CLI flags match prior H3 5090 server launches. Per the current
   instruction, this reorganization does not start a new GPU server; the new
   stack will not be described as end-to-end revalidated until such a run is

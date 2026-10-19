@@ -945,6 +945,127 @@ class TestPinnedResidentLayerGroup:
 
         torch.testing.assert_close(next_block.weight, expected)
         assert recorded_ranges == ["PinnedDMA/h2d_direct/slot0"]
+    def test_selective_stage_does_not_load_unrequested_parameters(self, patched_offload_runtime):
+        block = nn.Linear(2, 2)
+        expected_weight = block.weight.detach().clone()
+        expected_bias = block.bias.detach().clone()
+        weight = block.weight
+        group = PinnedResidentLayerGroup(
+            [block],
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            pin_memory=False,
+        )
+
+        staged_bytes = group.stage_parameters({id(weight)})
+
+        assert staged_bytes == expected_weight.numel() * expected_weight.element_size()
+        assert not group.loaded
+        torch.testing.assert_close(weight, expected_weight)
+        assert block.bias.numel() == 0
+        group.offload_parameters({id(weight)})
+        assert weight.numel() == 0
+
+        group.load()
+        torch.testing.assert_close(weight, expected_weight)
+        torch.testing.assert_close(block.bias, expected_bias)
+        group.offload()
+
+    def test_selectively_staged_parameters_can_be_pruned_before_full_load(
+        self, patched_offload_runtime
+    ):
+        block = nn.Linear(2, 2)
+        expected_bias = block.bias.detach().clone()
+        weight = block.weight
+        bias = block.bias
+        expected_removed_numel = weight.numel()
+        group = PinnedResidentLayerGroup(
+            [block],
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            pin_memory=False,
+            rank_local_mmap=True,
+        )
+
+        group.stage_parameters({id(weight)})
+        removed = group.exclude_parameters({id(weight)})
+
+        assert removed == expected_removed_numel
+        assert weight.numel() == 0
+        assert not group.loaded
+        assert all(
+            meta["name"] != "weight"
+            for metas in group._states[0]["metadata"].values()
+            for meta in metas
+        )
+        group.load()
+        torch.testing.assert_close(bias, expected_bias)
+        group.offload()
+
+    def test_pruning_cpu_shard_keeps_original_backing_without_duplicate_copy(
+        self, patched_offload_runtime
+    ):
+        block = nn.Linear(2, 2)
+        weight = block.weight
+        bias = block.bias
+        expected_bias = bias.detach().clone()
+        weight_numel = weight.numel()
+        expected_source = torch.cat((weight.detach().flatten(), bias.detach().flatten()))
+        group = PinnedResidentLayerGroup(
+            [block],
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            pin_memory=False,
+        )
+        master = group._states[0]["cpu_shards"][torch.float32]
+
+        removed = group.exclude_parameters({id(weight)})
+
+        assert removed == weight_numel
+        assert group._states[0]["cpu_shards"][torch.float32] is master
+        torch.testing.assert_close(master, expected_source)
+        [bias_meta] = group._states[0]["metadata"][torch.float32]
+        assert bias_meta["offset"] == 0
+        assert bias_meta["cpu_offset"] == weight_numel
+
+        # Both selective staging and the eventual all-resident load must read
+        # from the retained source offset while publishing compact GPU offsets.
+        group.stage_parameters({id(bias)})
+        torch.testing.assert_close(bias, expected_bias)
+        group.offload_parameters({id(bias)})
+        group.load()
+        torch.testing.assert_close(bias, expected_bias)
+        group.offload()
+        group.restore_to_cpu()
+        torch.testing.assert_close(bias, expected_bias)
+
+    def test_release_source_pages_targets_only_selected_mmap_parameters(self, monkeypatch):
+        first = nn.Parameter(torch.tensor([1.0, 2.0]))
+        second = nn.Parameter(torch.tensor([3.0, 4.0]))
+        group = object.__new__(PinnedResidentLayerGroup)
+        group.rank_local_mmap = True
+        group._states = [
+            {
+                "targets": {"first": first, "second": second},
+                "cpu_sources": {
+                    torch.float32: [
+                        {"name": "first", "tensor": first.detach(), "transform": None},
+                        {"name": "second", "tensor": second.detach(), "transform": None},
+                    ]
+                },
+            }
+        ]
+        released = []
+        monkeypatch.setattr(
+            dist_backend_module,
+            "_discard_file_backed_tensor_pages",
+            lambda tensor: released.append(tensor) or tensor.numel() * tensor.element_size(),
+        )
+
+        released_bytes = group.release_source_pages({id(first)})
+
+        assert released_bytes == 8
+        assert released == [group._states[0]["cpu_sources"][torch.float32][0]["tensor"]]
 
     def test_load_preserves_noncontiguous_weight_stride(self, patched_offload_runtime):
         block = nn.Module()
@@ -1207,15 +1328,72 @@ def test_hwr_registration_uses_transport_budget(
         return Registration()
 
     monkeypatch.setattr(dist_backend_module, "register_host_mappings", register)
-    pinned_source = SimpleNamespace(numel=lambda: 1, is_pinned=lambda: True)
+    pinned_source = torch.tensor([1.0])
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda _self: True)
+    lease.mapped_regions = (
+        MappedHostRegion(
+            "weights.safetensors",
+            pinned_source.data_ptr(),
+            pinned_source.untyped_storage().nbytes(),
+        ),
+    )
 
     assert backend._try_register_hwr_mmap((pinned_source,))  # type: ignore[arg-type]
-    assert calls == [(lease.mapped_regions, int(1.5 * 1024**3))]
+    assert calls[0][1] == int(1.5 * 1024**3)
+    assert len(calls[0][0]) == 1
+    assert calls[0][0][0].file_name == "weights.safetensors"
+    assert calls[0][0][0].address == pinned_source.data_ptr()
     assert dist_backend_module._ACTIVE_HWR_REGISTRATIONS == [(backend._host_registration, lease)]
 
     backend._release_registered_mmap()
 
     assert dist_backend_module._ACTIVE_HWR_REGISTRATIONS == []
+
+
+def test_hwr_registration_omits_pruned_adaln_ranges():
+    plan, _, _lease = _fake_hwr_plan()
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=True,
+            dp_size=1,
+            dlo_use_allgather=False,
+        ),
+        torch.device("cpu"),
+        host_weight_plan=plan,
+    )
+    backing = torch.arange(16, dtype=torch.float32)
+    projection = backing[:8]
+    retained = backing[8:]
+    backend._resident_layer_group = SimpleNamespace(
+        _states=[
+            {
+                "cpu_sources": {
+                    torch.float32: [
+                        {
+                            "name": "adaln_proj.linear.weight",
+                            "tensor": projection,
+                            "transform": None,
+                        },
+                        {"name": "attn.proj.weight", "tensor": retained, "transform": None},
+                    ]
+                }
+            }
+        ]
+    )
+    source_tensors = backend._rank_local_source_tensors([], exclude_adaln_projections=True)
+    assert len(source_tensors) == 1
+    assert source_tensors[0] is retained
+
+    mapped = MappedHostRegion(
+        "weights.safetensors",
+        backing.data_ptr(),
+        backing.untyped_storage().nbytes(),
+    )
+    regions = backend._mapped_regions_for_tensors((mapped,), source_tensors)
+    assert len(regions) == 1
+    assert regions[0].address == retained.data_ptr()
+    assert regions[0].length == retained.numel() * retained.element_size()
 
 
 def test_hwr_registration_budget_validation_is_transport_scoped():

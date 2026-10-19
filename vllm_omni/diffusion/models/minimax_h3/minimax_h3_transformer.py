@@ -63,6 +63,50 @@ from .adaln_cache import MiniMaxH3RuntimeAdalnCache
 from .fasth3 import _resolve_native_target
 from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
+
+def _adaln_pruning_conflicts_with_offload(
+    strategy: OffloadStrategy,
+    *,
+    offloads_dit: bool,
+    resident_layers: int,
+    num_layers: int,
+    use_hsdp: bool,
+) -> bool:
+    """Allow DLO only when every H3 DiT block is in the resident group."""
+    all_dit_blocks_resident = (
+        strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        and offloads_dit
+        and resident_layers >= num_layers
+    )
+    return use_hsdp or (
+        strategy is not OffloadStrategy.NONE and offloads_dit and not all_dit_blocks_resident
+    )
+
+
+def _validate_adaln_pruning_quantization(
+    projections: Iterable[tuple[str, nn.Module]],
+    quant_config: Any | None,
+) -> None:
+    """Allow pruning only when every cached AdaLN projection remains exact."""
+    if quant_config is None:
+        return
+
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    quantized = [
+        name
+        for name, projection in projections
+        if projection.linear is None
+        or getattr(getattr(projection.linear, "quant_method", None), "_gemm_impl", None)
+        is not default_unquantized_gemm
+    ]
+    if quantized:
+        raise ValueError(
+            "AdaLN weight pruning requires exact unquantized AdaLN projections; "
+            f"quantized or unsupported projections: {quantized[:4]}"
+        )
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
@@ -803,6 +847,8 @@ class MiniMaxH3AdalnProj(nn.Module):
                 f"adaln out_features mismatch: {out_features} != {expand_ratio}*{arch.hidden_size}*{modality_num}"
             )
         self._adaln_cache = adaln_cache
+        self._weights_pruned = False
+        self._pruned_layer_index: int | None = None
         self._offload_weights = adaln_cache is not None and adaln_cache.offload_weights
         self._weight_stager: PinnedModuleStager | None = None
         self._host_signature: tuple[Any, ...] | None = None
@@ -826,6 +872,8 @@ class MiniMaxH3AdalnProj(nn.Module):
             )
 
     def _apply(self, fn, recurse=True):
+        if self._weights_pruned:
+            raise RuntimeError("Cannot move a MiniMax H3 model after AdaLN weights have been pruned")
         self._weight_stager = None
         self._host_signature = None
         if self._adaln_cache is not None:
@@ -870,15 +918,22 @@ class MiniMaxH3AdalnProj(nn.Module):
             self._host_signature = self._offload_signature()
 
     def _project(self, t_emb: torch.Tensor) -> torch.Tensor:
+        if self._weights_pruned:
+            if self._adaln_cache is None:
+                raise RuntimeError("Pruned AdaLN projection lost its verified cache")
+            return self._adaln_cache.project_pruned(
+                self._cache_name,
+                t_emb,
+                layer_index=self._pruned_layer_index,
+            )
         self._prepare_weight_stager(t_emb.device)
 
         def project() -> torch.Tensor:
-            x = nn.functional.silu(t_emb)
             if self._weight_stager is None:
-                return self.linear(x.to(_BF16_DTYPE))[0]
+                return self._compute_projection(t_emb)
             self._weight_stager.load()
             try:
-                return self.linear(x.to(_BF16_DTYPE))[0]
+                return self._compute_projection(t_emb)
             finally:
                 self._weight_stager.offload()
 
@@ -887,6 +942,11 @@ class MiniMaxH3AdalnProj(nn.Module):
             if self._adaln_cache is None
             else self._adaln_cache.project(self._cache_name, self.linear, t_emb, project)
         )
+
+    def _compute_projection(self, t_emb: torch.Tensor) -> torch.Tensor:
+        """Run the exact unquantized serving linear used by the cache builder."""
+        x = nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        return self.linear(x)[0]
 
     @torch.compiler.disable
     def _project_cached(self, t_emb: torch.Tensor) -> torch.Tensor:
@@ -1303,6 +1363,20 @@ class MiniMaxH3DiTModel(nn.Module):
             raise ValueError("MiniMax H3 staged weight DMA requires CUDA")
         self._staged_dma_enabled = staged_dma
         self._staged_weight_stager = None
+        prune_adaln_weights = (
+            cache_config.get("minimax_h3_adaln_prune_weights", False)
+            if isinstance(cache_config, Mapping)
+            else getattr(cache_config, "minimax_h3_adaln_prune_weights", False)
+        )
+        prune_min_steps = (
+            cache_config.get("minimax_h3_adaln_prune_min_steps", 50)
+            if isinstance(cache_config, Mapping)
+            else getattr(cache_config, "minimax_h3_adaln_prune_min_steps", 50)
+        )
+        if type(prune_adaln_weights) is not bool:
+            raise ValueError("minimax_h3_adaln_prune_weights must be a boolean")
+        if type(prune_min_steps) is not int or prune_min_steps < 1:
+            raise ValueError("minimax_h3_adaln_prune_min_steps must be a positive integer")
         enabled = (
             cache_config.get("minimax_h3_adaln_cache", True)
             if isinstance(cache_config, Mapping)
@@ -1310,15 +1384,26 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         if type(enabled) is not bool:
             raise ValueError("minimax_h3_adaln_cache must be a boolean")
+        if prune_adaln_weights and not enabled:
+            raise ValueError("AdaLN weight pruning requires minimax_h3_adaln_cache=true")
         offload = resolve_offload(od_config)
+        use_hsdp = bool(getattr(od_config.parallel_config, "use_hsdp", False))
         conflicting_offload = (
             offload.strategy is not OffloadStrategy.NONE and offload.offloads(DIT_COMPONENT)
-        ) or getattr(od_config.parallel_config, "use_hsdp", False)
+        ) or use_hsdp
+        pruning_conflict = _adaln_pruning_conflicts_with_offload(
+            offload.strategy,
+            offloads_dit=offload.offloads(DIT_COMPONENT),
+            resident_layers=offload.resident_layers,
+            num_layers=arch.num_layers,
+            use_hsdp=use_hsdp,
+        )
         # Limit automatic offload to the validated SM120 deployment. Other
         # CUDA architectures keep their resident weights unless opted in.
         # Use the worker's current device, not logical device zero.
         default_offload_adaln = (
             enabled
+            and not prune_adaln_weights
             and current_omni_platform.is_cuda()
             and quant_config is None
             and not conflicting_offload
@@ -1339,8 +1424,17 @@ class MiniMaxH3DiTModel(nn.Module):
             if conflicting_offload:
                 raise ValueError("MiniMax H3 AdaLN offload cannot be combined with DiT offload or HSDP")
             logger.info("MiniMax H3 AdaLN weights remain on CPU; projections stage on cache misses only")
+        if prune_adaln_weights and (offload_adaln or pruning_conflict):
+            raise ValueError(
+                "AdaLN weight pruning requires AdaLN offload disabled and either no DiT offload, "
+                "or distributed layer-wise offload with every MiniMax H3 DiT block resident; "
+                "HSDP is unsupported"
+            )
         self.adaln_cache = MiniMaxH3RuntimeAdalnCache(
-            max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
+            max_bytes=256 * 1024**2 if enabled else 0,
+            offload_weights=offload_adaln,
+            prune_weights=prune_adaln_weights,
+            prune_min_steps=prune_min_steps,
         )
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
@@ -1420,6 +1514,17 @@ class MiniMaxH3DiTModel(nn.Module):
             prefix="final_layer",
             adaln_cache=self.adaln_cache,
         )
+        if prune_adaln_weights:
+            _validate_adaln_pruning_quantization(
+                [
+                    *(
+                        (f"blocks.{index}.adaln_proj", block.adaln_proj)
+                        for index, block in enumerate(self.blocks)
+                    ),
+                    ("final_layer.adaln_proj", self.final_layer.adaln_proj),
+                ],
+                quant_config,
+            )
         self._mark_missing_params_required()
 
     def enable_vsa_gates(self, *, sparsity: float | None = None) -> None:
@@ -1527,9 +1632,227 @@ class MiniMaxH3DiTModel(nn.Module):
             if name in MINIMAX_H3_FP32_BUFFER_NAMES and buffer.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {buffer.dtype}.")
 
+    def prune_adaln_weights(self) -> int:
+        """Drop projection parameters after a matching exact sidecar is verified.
+
+        The sidecar is bound to the complete AdaLN/time-embedder weights and a
+        fixed task/schedule. ``diffuse`` calls this only after the incoming
+        request has passed that schedule contract.
+        """
+        cache = self.adaln_cache
+        if not cache.prune_weights_requested:
+            return 0
+        if cache.weights_pruned:
+            return 0
+        if cache.sidecar is None or not cache.sidecar._ready:
+            raise RuntimeError("AdaLN weight pruning requires a loaded and verified sidecar")
+
+        projections = [
+            (f"blocks.{index}.adaln_proj.linear", block.adaln_proj)
+            for index, block in enumerate(self.blocks)
+        ]
+        projections.append(("final_layer.adaln_proj.linear", self.final_layer.adaln_proj))
+        missing = [name for name, _ in projections if name not in cache._sidecar_signatures]
+        if missing:
+            raise RuntimeError(f"AdaLN sidecar has no verified projection identities: {missing}")
+        if any(projection.linear is None for _, projection in projections):
+            raise RuntimeError("AdaLN projection was removed before the sidecar could be validated")
+
+        removed_parameters = sum(
+            parameter.numel()
+            for _, projection in projections
+            for parameter in projection.linear.parameters()
+        )
+        for index, (_, projection) in enumerate(projections):
+            projection._weights_pruned = True
+            projection._pruned_layer_index = index if index < len(self.blocks) else None
+            projection.linear = None
+        cache.weights_pruned = True
+        cache.pruned_schedule = dict(cache.sidecar.manifest["schedule"])
+        logger.info(
+            "Pruned %d MiniMax H3 AdaLN projection parameters; exact outputs are fixed "
+            "to the verified sidecar schedule",
+            removed_parameters,
+        )
+        return removed_parameters
+
+    @torch.inference_mode()
+    def prepare_adaln_pruning(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        parameter_stager: Any | None = None,
+    ) -> int:
+        """Precompute one request schedule with the live rank-local projections.
+
+        Offline AdaLN artifacts are built with TP1 Torch linear semantics. For
+        pruning under TP/USP, produce the lookup table on each serving rank so
+        it captures the actual sharded GEMMs, collectives, and numerical mode.
+        """
+        from .adaln_cache import MiniMaxH3AdalnCache, schedule_contract, timestep_plans
+
+        cache = self.adaln_cache
+        if not cache.prune_weights_requested:
+            return 0
+        checked_contract = schedule_contract(**contract)
+        if not cache.should_prune(checked_contract["num_steps"]):
+            raise RuntimeError(
+                f"AdaLN pruning is deferred until at least {cache.prune_min_steps} denoising steps"
+            )
+        if cache.weights_pruned:
+            if cache.sidecar is None:
+                raise RuntimeError("Pruned AdaLN model lost its schedule cache")
+            cache.sidecar.check_request(**checked_contract)
+            return 0
+        if cache.offload_weights:
+            raise RuntimeError("AdaLN runtime precompute cannot use CPU-offloaded projection weights")
+        if cache.sidecar is not None:
+            cache.sidecar.check_request(**checked_contract)
+            return 0
+        if cache._has_forward_hooks(self.time_embedder):
+            raise RuntimeError("AdaLN schedule pruning does not support time-embedder forward hooks")
+
+        device = self.time_embedder.proj_in.weight.device
+        if device.type == "meta":
+            raise RuntimeError("AdaLN runtime precompute requires loaded time-embedder weights")
+        if torch.is_autocast_enabled(device.type):
+            raise RuntimeError("AdaLN schedule pruning requires autocast to be disabled")
+        plans = timestep_plans(checked_contract)
+        width = max(len(plan) for plan in plans)
+        tp_world_size = get_tensor_model_parallel_world_size()
+        logger.info(
+            "AdaLN prune schedule precompute starting: plans=%d max_condition_batch=%d steps=%d",
+            len(plans),
+            width,
+            checked_contract["num_steps"],
+        )
+        payload = {
+            "plan_timesteps": torch.zeros((len(plans), width), dtype=torch.float32, device=device),
+            "plan_lengths": torch.tensor([len(plan) for plan in plans], dtype=torch.int64, device=device),
+            "time_embeddings": torch.zeros(
+                (len(plans), width, self.arch.time_embed_dim), dtype=torch.float32, device=device
+            ),
+            "block_params": torch.zeros(
+                (len(plans), self.arch.num_layers, width, 18 * self.arch.hidden_size),
+                dtype=_BF16_DTYPE,
+                device=device,
+            ),
+            "final_params": torch.zeros(
+                (len(plans), width, 2 * self.arch.hidden_size), dtype=_BF16_DTYPE, device=device
+            ),
+        }
+        modules: dict[str, nn.Module] = {}
+        final_projection = self.final_layer.adaln_proj
+        if final_projection.linear is None:
+            raise RuntimeError("Final AdaLN projection was removed before schedule precompute")
+        if cache._has_forward_hooks(final_projection.linear):
+            raise RuntimeError("AdaLN schedule pruning does not support projection forward hooks")
+        modules["final_layer.adaln_proj.linear"] = final_projection.linear
+
+        def project_schedule(projection: MiniMaxH3AdalnProj) -> list[torch.Tensor]:
+            """Preserve each timestep GEMM shape and gather its rows once."""
+            linear = projection.linear
+            if linear is None:
+                raise RuntimeError("AdaLN projection was removed before schedule precompute")
+            gather_output = getattr(linear, "gather_output", False)
+            combine_tp_gather = gather_output and tp_world_size > 1
+            if combine_tp_gather:
+                # ColumnParallelLinear normally gathers each small timestep
+                # result separately. Keep the same local GEMM shape and order,
+                # but defer the TP gather until all schedule rows are ready.
+                linear.gather_output = False
+            try:
+                local_values = [
+                    projection._compute_projection(payload["time_embeddings"][index, : len(plan)])
+                    for index, plan in enumerate(plans)
+                ]
+            finally:
+                if combine_tp_gather:
+                    linear.gather_output = gather_output
+
+            values = torch.cat(local_values, dim=0)
+            if combine_tp_gather:
+                from vllm.distributed import tensor_model_parallel_all_gather
+
+                values = tensor_model_parallel_all_gather(values.contiguous())
+            return list(values.split([len(plan) for plan in plans], dim=0))
+
+        for index, plan in enumerate(plans):
+            count = len(plan)
+            payload["plan_timesteps"][index, :count] = plan.to(device=device)
+            embedding = self.time_embedder(plan.to(device=device))
+            payload["time_embeddings"][index, :count].copy_(embedding)
+            if (index + 1) % 5 == 0 or index + 1 == len(plans):
+                logger.info("AdaLN prune schedule precompute progress: %d/%d plans", index + 1, len(plans))
+
+        # Keep the original per-plan projection shapes to retain identical
+        # BF16 outputs. Combine only the TP gather across schedule rows.
+        for index, value in enumerate(project_schedule(final_projection)):
+            payload["final_params"][index, : len(plans[index])].copy_(value)
+
+        # Load one block projection at a time. The schedule table remains on
+        # device, while HWR/DLO mmap source pages for completed projections can
+        # be reclaimed before the next block is staged.
+        if parameter_stager is not None:
+            logger.warning(
+                "AdaLN runtime precompute will stage %d block projections one at a time before full DLO load",
+                len(self.blocks),
+            )
+        released_mmap_bytes = 0
+        for block_index, block in enumerate(self.blocks):
+            projection = block.adaln_proj
+            if projection.linear is None:
+                raise RuntimeError("AdaLN projection was removed before schedule precompute")
+            if cache._has_forward_hooks(projection.linear):
+                raise RuntimeError("AdaLN schedule pruning does not support projection forward hooks")
+            modules[f"blocks.{block_index}.adaln_proj.linear"] = projection.linear
+            projection_parameters = tuple(projection.linear.parameters())
+            if parameter_stager is not None:
+                parameter_stager.stage_resident_parameters(projection_parameters)
+            try:
+                for index, value in enumerate(project_schedule(projection)):
+                    payload["block_params"][index, block_index, : len(plans[index])].copy_(value)
+            finally:
+                if parameter_stager is not None:
+                    parameter_stager.offload_resident_parameters(projection_parameters)
+                    release_pages = getattr(parameter_stager, "release_resident_source_pages", None)
+                    if callable(release_pages):
+                        released_mmap_bytes += release_pages(projection_parameters)
+        if parameter_stager is not None:
+            logger.warning(
+                "AdaLN block precompute requested mmap page release for %d source bytes",
+                released_mmap_bytes,
+            )
+
+        variant = "ref2va" if checked_contract["mode"].startswith("ref2va") else "fl2va"
+        sidecar = MiniMaxH3AdalnCache.from_runtime(
+            self.arch,
+            payload,
+            contract=checked_contract,
+            model_variant=variant,
+            device=device,
+        )
+        cache.clear()
+        cache.seed(sidecar, modules, frozen=True)
+        total_bytes = sum(value.numel() * value.element_size() for value in payload.values())
+        logger.info(
+            "Built rank-exact MiniMax H3 AdaLN schedule cache for %d timesteps across TP=%d, USP=%d (%d bytes)",
+            sum(len(plan) for plan in plans),
+            get_tensor_model_parallel_world_size(),
+            int(self.parallel_config.ulysses_degree),
+            total_bytes,
+        )
+        return total_bytes
+
     def validate_restored_host_weights(self) -> None:
         """Validate mixed-precision invariants after lease-backed restore."""
         self.post_load_weights()
+
+    def select_adaln_pruned_step(self, step: int) -> None:
+        """Select the verified AdaLN table row before one denoising forward."""
+        cache = getattr(self, "adaln_cache", None)
+        if cache is not None:
+            cache.select_pruned_step(step)
 
     def load_weights(
         self,

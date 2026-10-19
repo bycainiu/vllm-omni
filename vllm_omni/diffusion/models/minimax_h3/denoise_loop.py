@@ -411,7 +411,10 @@ def minimax_h3_denoise_loop(
                 video_target_timesteps=video_target_timesteps,
                 audio_target_timesteps=audio_target_timesteps,
             )
+            select_adaln_step = getattr(model, "select_adaln_pruned_step", None)
             with torch.inference_mode():
+                if callable(select_adaln_step):
+                    select_adaln_step(step)
                 v_video, v_audio = model(**fk)
             mv_video_t = v_video.float()[update]
             mv_audio_t = v_audio.float()[audio_update]
