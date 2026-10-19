@@ -176,6 +176,34 @@ INT8-QKV-only experiment regressed denoising by 13.9% and changed output
 quality; that result is not evidence for the new paired wire format, but it is
 a reason not to claim a speedup without a fresh A/B.
 
+## Cache-DiT high profile on H3's DiT block core
+
+The clean base already provides request-level `quality=high` and an H3
+Cache-DiT adapter over the repeated DiT block stack, which contains the QKV
+core. The request uses the conservative H3 profile (`residual_diff_threshold`
+0.04, one continuous cached step, four warmup steps); it does not require a
+Cache-DiT startup backend. Keep the same model and launch settings and change
+only request `quality` for the `high` versus `lossless` comparison:
+
+```bash
+MINIMAX_H3_API_URL=http://127.0.0.1:18105/v1/videos/sync \
+MINIMAX_H3_PROMPT='A fixed prompt for the comparison' \
+MINIMAX_H3_REFERENCE_IMAGE=/path/to/reference.png \
+./experiments/minimax_h3_5090_integration/request_quality.sh high > high.mp4
+
+MINIMAX_H3_API_URL=http://127.0.0.1:18105/v1/videos/sync \
+MINIMAX_H3_PROMPT='A fixed prompt for the comparison' \
+MINIMAX_H3_REFERENCE_IMAGE=/path/to/reference.png \
+./experiments/minimax_h3_5090_integration/request_quality.sh lossless > lossless.mp4
+```
+
+The historical 8-GPU high-profile run reported 29.454 s denoising, 19 of 50
+steps reused, SSIM 0.845552, and PSNR 29.0857 dB. Its model path was
+`/mnt/data/MiniMax-H3`; it did not record the staged offline-FP8 checkpoint or
+a matched full-FP8 control. Treat it as a historical speed/quality observation,
+not a confirmed result for the FP8 stack or TP2×USP4. The high profile changes
+the denoising trajectory, so its quality trade-off must be accepted separately.
+
 ### Validation record
 
 - `bash -n` and local dry runs passed for the default TP2×USP4/DLO50 configuration
@@ -193,6 +221,9 @@ a reason not to claim a speedup without a fresh A/B.
 - Communication-quantization CUDA smoke exists in the source snapshot; it was
   not run during this reorganization. Its paired INT8/FP8 latency and quality
   remain unmeasured on the ordered stack.
+- Cache-DiT request-quality selection and H3 block-adapter tests are part of
+  the clean baseline. The 5090 high-profile measurement is historical and not
+  full-FP8 evidence.
 - The selected CLI flags match prior H3 5090 server launches. Per the current
   instruction, this reorganization does not start a new GPU server; the new
   stack will not be described as end-to-end revalidated until such a run is
