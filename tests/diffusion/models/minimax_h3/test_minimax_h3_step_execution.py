@@ -210,6 +210,32 @@ def test_request_mode_cancellation_stops_before_next_denoise_step(monkeypatch):
     assert steps == [0]
 
 
+def test_denoise_loop_votes_once_per_step_boundary(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import denoise_loop as mod
+
+    calls = []
+    monkeypatch.setattr(mod, "check_request_cancellation", lambda **kwargs: calls.append(kwargs))
+    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=5)
+    sigmas_video = _sigmas(6, 12.0)
+    sigmas_audio = _sigmas(6, 3.0)
+
+    mod.minimax_h3_denoise_loop(
+        model=_SegmentMeanModel(),
+        positive=branch,
+        initial_video_rows=video_rows,
+        initial_audio_rows=audio_rows,
+        keyframe_cond_rows=None,
+        sigmas_video=sigmas_video,
+        sigmas_audio=sigmas_audio,
+        device=torch.device("cpu"),
+    )
+
+    num_steps = len(sigmas_video) - 1
+    assert len(calls) == num_steps + 1
+    assert calls[:-1] == [{}] * num_steps
+    assert calls[-1] == {"synchronize": True}
+
+
 @pytest.mark.parametrize("mixed_unguided", [False, True])
 def test_timeline_guides_request_step_batch_parity_and_target_only_unpack(mixed_unguided):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod

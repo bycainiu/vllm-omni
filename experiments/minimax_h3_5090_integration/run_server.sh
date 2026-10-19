@@ -7,6 +7,7 @@ USP_SIZE="${MINIMAX_H3_USP_SIZE:-4}"
 DLO_RESIDENT_LAYERS="${MINIMAX_H3_DLO_RESIDENT_LAYERS:-50}"
 TEXT_ENCODER_INIT_ON_CPU="${MINIMAX_H3_TEXT_ENCODER_INIT_ON_CPU:-0}"
 CACHE_CONFIG="${MINIMAX_H3_CACHE_CONFIG:-}"
+QKV_A2A_FUSION="${MINIMAX_H3_QKV_A2A_FUSION:-1}"
 
 for value_name in TP_SIZE USP_SIZE DLO_RESIDENT_LAYERS; do
   value="${!value_name}"
@@ -17,6 +18,10 @@ for value_name in TP_SIZE USP_SIZE DLO_RESIDENT_LAYERS; do
 done
 [[ "$TEXT_ENCODER_INIT_ON_CPU" == 0 || "$TEXT_ENCODER_INIT_ON_CPU" == 1 ]] || {
   echo "MINIMAX_H3_TEXT_ENCODER_INIT_ON_CPU must be 0 or 1, got: ${TEXT_ENCODER_INIT_ON_CPU}" >&2
+  exit 2
+}
+[[ "$QKV_A2A_FUSION" == 0 || "$QKV_A2A_FUSION" == 1 ]] || {
+  echo "MINIMAX_H3_QKV_A2A_FUSION must be 0 or 1, got: ${QKV_A2A_FUSION}" >&2
   exit 2
 }
 (( TP_SIZE > 0 && USP_SIZE > 0 )) || {
@@ -42,6 +47,7 @@ GPU_COUNT="$(awk -F, '{print NF}' <<< "$GPU_LIST")"
 }
 export CUDA_VISIBLE_DEVICES="$GPU_LIST"
 export MINIMAX_H3_TEXT_ENCODER_INIT_ON_CPU="$TEXT_ENCODER_INIT_ON_CPU"
+export MINIMAX_H3_QKV_A2A_FUSION="$QKV_A2A_FUSION"
 DRY_RUN="${MINIMAX_H3_DRY_RUN:-0}"
 [[ "$DRY_RUN" == 0 || "$DRY_RUN" == 1 ]] || {
   echo "MINIMAX_H3_DRY_RUN must be 0 or 1, got: ${DRY_RUN}" >&2
@@ -77,6 +83,7 @@ fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   printf 'CUDA_VISIBLE_DEVICES=%q ' "$CUDA_VISIBLE_DEVICES"
+  printf 'MINIMAX_H3_QKV_A2A_FUSION=%q ' "$MINIMAX_H3_QKV_A2A_FUSION"
   printf '%q ' "${COMMAND[@]}"
   printf '\n'
   exit 0

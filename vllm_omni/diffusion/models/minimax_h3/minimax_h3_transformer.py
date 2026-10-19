@@ -2098,6 +2098,9 @@ class MiniMaxH3DiTModel(nn.Module):
         `img_pos_for_infer_output_info` and `audio_pos_info`, with condition
         rows zeroed by update masks.
         """
+        if is_forward_context_available():
+            get_forward_context().minimax_h3_qkv_fusion = True
+
         # Strict keyword contract: refuse any kwarg forward does not consume.
         unexpected = sorted(set(kwargs) - _FORWARD_SUPPORTED_KWARGS)
         if unexpected:

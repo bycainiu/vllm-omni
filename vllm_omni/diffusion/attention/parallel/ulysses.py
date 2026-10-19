@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -12,7 +13,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
-from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
+from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
@@ -21,6 +22,27 @@ from vllm_omni.diffusion.forward_context import (
 )
 
 logger = init_logger(__name__)
+
+
+def _h3_qkv_fusion_enabled() -> bool:
+    """Use packed Q/K/V A2A in active Ulysses regions unless explicitly disabled."""
+    if not is_forward_context_available():
+        return False
+    context = get_forward_context()
+    if not context.minimax_h3_qkv_fusion or not context.sp_active:
+        return False
+    return os.environ.get("MINIMAX_H3_QKV_A2A_FUSION", "1").lower() not in {"0", "false", "off", "no"}
+
+
+def _same_qkv_layout(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, world_size: int) -> bool:
+    """Whether Q/K/V share a payload layout suitable for one packed exchange."""
+    return (
+        world_size > 1
+        and query.ndim == 4
+        and query.shape == key.shape == value.shape
+        and query.dtype == key.dtype == value.dtype
+        and query.device == key.device == value.device
+    )
 
 # When advanced_uaa pads Q by the GQA ratio, MQA/very-uneven-GQA shapes can
 # inflate the query-head count substantially (worst case: MQA @ U=N pads Q from
@@ -535,8 +557,34 @@ class UlyssesParallelAttention:
                         f"Try ulysses_degree in {supported}, or set ulysses_mode='advanced_uaa'."
                     )
 
+            can_fuse_qkv = (
+                _h3_qkv_fusion_enabled()
+                and _same_qkv_layout(query, key, value, ulysses_world_size)
+                and self._scatter_idx == 2
+                and self._gather_idx == 1
+                and not _a2a_permute_enabled(
+                    self._ulysses_a2a_permute,
+                    self._scatter_idx,
+                    self._gather_idx,
+                    ulysses_world_size,
+                )
+            )
+            if can_fuse_qkv:
+                qkv = torch.stack((query, key, value), dim=2)
+                qkv = SeqAllToAll5D.apply(
+                    self._ulysses_pg,
+                    qkv,
+                    3,
+                    1,
+                    self._use_sync,
+                )
+                query, key, value = qkv.unbind(dim=2)
+                if gate_compress is not None:
+                    gate_compress = SeqAllToAll4D.apply(
+                        self._ulysses_pg, gate_compress, self._scatter_idx, self._gather_idx, self._use_sync
+                    )
             # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-            if _a2a_permute_enabled(
+            elif _a2a_permute_enabled(
                 self._ulysses_a2a_permute,
                 self._scatter_idx,
                 self._gather_idx,

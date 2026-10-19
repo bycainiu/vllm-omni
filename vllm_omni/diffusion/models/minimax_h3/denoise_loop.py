@@ -456,8 +456,13 @@ def minimax_h3_denoise_loop(
                 audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
-            check_request_cancellation(synchronize=True)
 
+    # The next iteration checks cancellation before starting more model work.
+    # A second vote at the end of every non-final iteration repeats the same
+    # boundary check, adding a blocking Gloo collective without improving the
+    # cancellation point. Keep one final check so cancellation during the last
+    # step still drains pending device work before the request returns.
+    check_request_cancellation(synchronize=True)
     minimax_h3_publish_denoise_progress(None, None, None)
     return video_rows, audio_rows
 

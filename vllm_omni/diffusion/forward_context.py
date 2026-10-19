@@ -48,6 +48,9 @@ class ForwardContext:
     # a malformed paged request whose Worker adapter was not activated.
     in_diffusion_kv_memory_profile: bool = False
     split_text_embed_in_sp: bool = False
+    # MiniMax H3 marks the active request so its optional packed QKV transport
+    # cannot affect unrelated models using the shared Ulysses implementation.
+    minimax_h3_qkv_fusion: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
     total_denoise_steps: int | None = None

@@ -85,6 +85,7 @@ The design contracts separate selection mechanics from backend algorithms:
 ## Infrastructure and Performance
 
 - [Prometheus Metrics](metrics.md)
+- [MiniMax H3 FP8 Communication Optimization on 8x RTX 5090](minimax_h3_5090_fp8_communication_optimization.md)
 - [Speech Generation Performance Optimizations](qwen3_omni_tts_performance_optimization.md)
 
 ## Module Design Documents
