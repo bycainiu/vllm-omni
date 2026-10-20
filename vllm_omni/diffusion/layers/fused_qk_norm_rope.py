@@ -25,6 +25,8 @@ unsupported inputs use the eager reference.
 
 from __future__ import annotations
 
+import os
+from functools import lru_cache
 from importlib.util import find_spec
 
 import torch
@@ -42,6 +44,9 @@ _FUSED_ROTARY_DIM = 96
 # Interleaved-mode geometry bounds (any even rotary_dim <= head_dim <= this).
 _FUSED_MAX_HEAD_DIM = 256
 _HEADS_PER_PROGRAM = 8
+# H3 on RTX 5090: a 16-head CTA halves the grid while retaining eight warps.
+_H3_RTX5090_HEADS_PER_PROGRAM = 16
+_H3_RTX5090_NUM_WARPS = 8
 # The combined interleaved kernel: small tiles + one warp measured fastest
 # (latency-bound shapes; see the kernel docstring).
 _INTERLEAVED_HEADS_PER_PROGRAM = 4
@@ -441,7 +446,9 @@ def _launch_fused_rms_norm_rope(
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if tokens == 0:
         return out
-    grid = (tokens, triton.cdiv(heads, _HEADS_PER_PROGRAM))
+    use_5090_tile = os.environ.get("MINIMAX_H3_QK_NORM_ROPE_5090_TILE") == "1"
+    heads_per_program, num_warps = _h3_cuda_tile_config(x.device.index, use_5090_tile)
+    grid = (tokens, triton.cdiv(heads, heads_per_program))
     _rms_norm_rope_kernel[grid](
         x,
         weight,
@@ -458,10 +465,22 @@ def _launch_fused_rms_norm_rope(
         head_dim=head_dim,
         rotary_half=rotary_half,
         eps=eps,
-        heads_per_program=_HEADS_PER_PROGRAM,
-        num_warps=8,
+        heads_per_program=heads_per_program,
+        num_warps=num_warps,
     )
     return out
+
+
+@lru_cache(maxsize=None)
+def _h3_cuda_tile_config(device_index: int | None, use_5090_tile: bool = False) -> tuple[int, int]:
+    """Select the experimental MiniMax-H3 half-split tile by device and opt-in."""
+    if not use_5090_tile:
+        return _HEADS_PER_PROGRAM, 8
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if "RTX 5090" in torch.cuda.get_device_name(device_index):
+        return _H3_RTX5090_HEADS_PER_PROGRAM, _H3_RTX5090_NUM_WARPS
+    return _HEADS_PER_PROGRAM, 8
 
 
 def _launch_fused_qk_norm_rope(

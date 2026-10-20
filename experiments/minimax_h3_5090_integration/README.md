@@ -21,6 +21,7 @@ environment variables:
 | `MINIMAX_H3_QKV_A2A_FUSION` | `1` | Use strict Ulysses QKV fusion; set `0` for control |
 | `MINIMAX_H3_QKV_WIRE_DTYPE` | `bf16` | Q/K/V transport dtype; opt in to `int8` |
 | `MINIMAX_H3_OUTPUT_WIRE_DTYPE` | `bf16` | Attention-output transport dtype; opt in to `fp8` |
+| `MINIMAX_H3_QK_NORM_ROPE_5090_TILE` | `0` | Opt in to the experimental 16-head Q/K Norm + RoPE tile on RTX 5090 |
 
 The script derives `NUM_GPUS = TP_SIZE × USP_SIZE`, checks the visible GPU list,
 and passes the matching vLLM startup flags. Use `MINIMAX_H3_GPU_LIST` to select
@@ -43,6 +44,14 @@ AdaLN schedule caching and pruning, QKV A2A fusion with Gloo vote deduplication,
 the AdaLN-QKV tile64/4-warps kernel, Ulysses INT8 QKV and FP8 attention-output
 transport, and high-threshold Cache-DiT on the QKV core. Each result and
 validation state is recorded here.
+
+The optional RTX 5090 Q/K Norm + RoPE tile is appended as a separate operator
+point. Leave `MINIMAX_H3_QK_NORM_ROPE_5090_TILE` unset for the baseline
+8-head/8-warp launch; set it to `1` to select 16 heads/8 warps on RTX 5090.
+The historical isolated 14-head profile measured 15.9% lower per-kernel time,
+but that is not a full-FP8 request result. The current four-card 28-head probe
+found no stable gain, so the option stays off by default pending a matched
+TP2×USP4 validation.
 
 ## Offline FP8 weights
 
